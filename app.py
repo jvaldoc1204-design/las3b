@@ -447,7 +447,8 @@ with tab_factura:
         )
         st.info(
             "Con la clave gratuita de Gemini, Google puede usar lo que envías para "
-            "mejorar sus productos. No subas facturas con datos que no quieras compartir."
+            "mejorar sus productos. al ser gratis la IA puede saturarse y tardar en procesar."
+            "Si quieres algo bueno pagame la Clave de Gemini Pro Oliver"
         )
 
         archivo = elegir_archivo("factura", True)
@@ -608,7 +609,7 @@ with tab_retirar:
                 archivo_r = elegir_archivo("retiro", False)
 
                 if archivo_r is not None and st.button("🔍 Reconocer productos", key="btn_reconocer"):
-                    with st.spinner("Mirando la foto..."):
+                    with st.spinner("Mirando la foto... TRANQUILOOOO"):
                         try:
                             res = identificar_productos(
                                 archivo_r.getvalue(), archivo_r.type or "image/jpeg", productos
