@@ -4,7 +4,14 @@ import json
 import os
 import random
 import uuid
+import base64
+import re
 from datetime import date, datetime, timedelta
+
+try:
+    import requests
+except ImportError:  # sin esta librería la pestaña de facturas queda desactivada
+    requests = None
 
 try:
     import gspread
@@ -104,10 +111,12 @@ def guardar_lotes(lotes):
             hoja.update(values=filas, range_name="A1", value_input_option="RAW")
         except Exception as e:
             st.error(f"No pude guardar en Google Sheets: {e}")
-        return
+            return False
+        return True
 
     with open(ARCHIVO_DATOS, "w", encoding="utf-8") as f:
         json.dump(lotes, f, ensure_ascii=False, indent=4)
+    return True
 
 
 # En modo nube se recarga la planilla en cada interacción, así todos ven datos frescos.
@@ -116,7 +125,8 @@ if usar_sheets() or "lotes" not in st.session_state:
 
 
 def guardar():
-    guardar_lotes(st.session_state.lotes)
+    """Devuelve True solo si los datos realmente se guardaron."""
+    return guardar_lotes(st.session_state.lotes)
 
 
 def avisar(tipo, texto):
@@ -204,12 +214,13 @@ m3.metric("🟡 Por vencer (≤30 días)", por_vencer)
 m4.metric("🔴 Vencidos", vencidos)
 
 (tab_ingresar, tab_inventario, tab_venc,
- tab_retirar, tab_editar) = st.tabs([
+ tab_retirar, tab_editar, tab_factura) = st.tabs([
     "1. Ingresar mercadería",
     "2. Inventario",
     "3. Vencimientos",
     "4. Retirar / Reponer",
     "5. Editar o borrar lote",
+    "6. Escanear factura 🤖",
 ])
 
 
@@ -262,8 +273,8 @@ with tab_ingresar:
                         "proveedor": proveedor.strip(),
                         "ingreso": date.today().isoformat(),
                     })
-                guardar()
-                st.success(f"¡Listo! {int(cajas)} cajas de '{nombre_limpio}' ingresadas. Oliver mi peyito 🐶")
+                if guardar():
+                    st.success(f"¡Listo! {int(cajas)} cajas de '{nombre_limpio}' ingresadas. Oliver mi peyito 🐶")
 
 
 # -----------------------------------------------------
@@ -387,9 +398,9 @@ with tab_retirar:
                     detalle.append(f"{sacar} del lote que vence el {a_fecha(l['vencimiento']).strftime('%d/%m/%Y')}")
                 # Eliminar lotes que quedaron en cero
                 st.session_state.lotes = [l for l in st.session_state.lotes if l["cajas"] > 0]
-                guardar()
-                avisar("success", f"Retiradas {int(retirar)} cajas de '{producto}': " + "; ".join(detalle) + ".")
-                st.rerun()
+                if guardar():
+                    avisar("success", f"Retiradas {int(retirar)} cajas de '{producto}': " + "; ".join(detalle) + ".")
+                    st.rerun()
 
 
 # -----------------------------------------------------
@@ -435,17 +446,212 @@ with tab_editar:
                     lote["categoria"] = nueva_cat
                     lote["cajas"] = int(nuevas_cajas)
                     lote["vencimiento"] = nuevo_venc.isoformat()
-                    guardar()
-                    avisar("success", "Lote actualizado ✅")
-                    st.rerun()
+                    if guardar():
+                        avisar("success", "Lote actualizado ✅")
+                        st.rerun()
 
         st.divider()
         confirmar = st.checkbox("Confirmo que quiero borrar este lote de forma permanente")
         if st.button("🗑️ Borrar lote", disabled=not confirmar):
             st.session_state.lotes = [l for l in st.session_state.lotes if l["id"] != id_sel]
-            guardar()
-            avisar("success", "Lote eliminado.")
-            st.rerun()
+            if guardar():
+                avisar("success", "Lote eliminado.")
+                st.rerun()
+
+
+# -----------------------------------------------------
+#  6. ESCANEAR FACTURA CON IA
+# -----------------------------------------------------
+def modelo_ia():
+    """Modelo de Gemini. Se puede cambiar con 'gemini_model' en los Secrets."""
+    try:
+        return st.secrets["gemini_model"]
+    except Exception:
+        return "gemini-flash-latest"
+
+
+def ia_disponible():
+    try:
+        return requests is not None and "gemini_api_key" in st.secrets
+    except Exception:
+        return False
+
+
+def leer_factura(contenido, tipo):
+    """Envía la foto/PDF a Gemini y devuelve un diccionario con proveedor y productos."""
+    datos = base64.standard_b64encode(contenido).decode("utf-8")
+    parte_archivo = {"inline_data": {"mime_type": tipo, "data": datos}}
+
+    instrucciones = (
+        "Esta es una factura o guía de despacho de una distribuidora en Chile. "
+        "Extrae el nombre del proveedor y cada línea de producto con su cantidad. "
+        "Clasifica cada producto en una de estas categorías: "
+        + ", ".join(CATEGORIAS) + ". "
+        "Si no estás seguro de la categoría, usa 'Otros'. "
+        "No inventes productos ni cantidades: si una línea no se lee bien, omítela. "
+        "Responde SOLO con JSON válido, sin texto adicional, con este formato exacto: "
+        '{"proveedor": "", "productos": [{"nombre": "", "cantidad": 0, "categoria": ""}]}'
+    )
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo_ia()}:generateContent"
+    respuesta = requests.post(
+        url,
+        headers={"x-goog-api-key": st.secrets["gemini_api_key"],
+                 "Content-Type": "application/json"},
+        json={
+            "contents": [{"parts": [parte_archivo, {"text": instrucciones}]}],
+            "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
+        },
+        timeout=120,
+    )
+    if respuesta.status_code != 200:
+        raise RuntimeError(f"Gemini respondió {respuesta.status_code}: {respuesta.text[:300]}")
+    try:
+        partes = respuesta.json()["candidates"][0]["content"]["parts"]
+        texto = "".join(p.get("text", "") for p in partes)
+    except (KeyError, IndexError, TypeError, ValueError):
+        raise ValueError("Gemini no devolvió texto (¿foto ilegible o bloqueada?).")
+    encontrado = re.search(r"\{.*\}", texto, re.S)
+    if not encontrado:
+        raise ValueError("La IA no devolvió datos legibles.")
+    return json.loads(encontrado.group(0))
+
+
+with tab_factura:
+    st.subheader("Escanear factura con IA")
+
+    if not ia_disponible():
+        st.warning(
+            "Falta configurar la clave de la IA. En Streamlit Cloud entra a "
+            "Settings → Secrets y agrega una línea: gemini_api_key = \"tu_clave\" "
+            "(la clave se crea en aistudio.google.com/apikey)."
+        )
+    else:
+        st.caption(
+            "Toma una foto de la factura (o sube un PDF). La IA arma una tabla; "
+            "tú la revisas, completas los vencimientos y confirmas. "
+            "Nada entra al inventario hasta que presiones el botón final."
+        )
+        st.info(
+            "Ojo: con la clave gratuita de Gemini, Google puede usar lo que envías para "
+            "mejorar sus productos y personal suyo puede revisarlo. No subas facturas "
+            "con datos que no quieras compartir."
+        )
+
+        origen = st.radio("Origen:", ["Subir foto o PDF", "Usar cámara"], horizontal=True)
+        if origen == "Usar cámara":
+            archivo = st.camera_input("Toma una foto de la factura")
+        else:
+            archivo = st.file_uploader(
+                "Foto o PDF de la factura", type=["jpg", "jpeg", "png", "webp", "pdf"]
+            )
+
+        if archivo is not None and st.button("🔍 Leer factura"):
+            with st.spinner("Leyendo la factura..."):
+                try:
+                    tipo = archivo.type or "image/jpeg"
+                    st.session_state.factura = leer_factura(archivo.getvalue(), tipo)
+                except Exception as e:
+                    st.error(f"No pude leer la factura: {e}")
+
+        if "factura" in st.session_state:
+            fac = st.session_state.factura
+            st.divider()
+            st.write("**Revisa lo que leyó la IA** (puedes editar, agregar o borrar filas):")
+            proveedor_f = st.text_input("Proveedor:", value=str(fac.get("proveedor") or ""))
+
+            filas = []
+            for p in fac.get("productos", []):
+                cat = p.get("categoria")
+                try:
+                    cant = max(int(float(p.get("cantidad") or 1)), 1)
+                except (TypeError, ValueError):
+                    cant = 1
+                filas.append({
+                    "Incluir": True,
+                    "Producto": str(p.get("nombre") or "").strip(),
+                    "Categoría": cat if cat in CATEGORIAS else "Otros",
+                    "Cajas": cant,
+                    "Vencimiento": None,
+                })
+            df_f = pd.DataFrame(
+                filas, columns=["Incluir", "Producto", "Categoría", "Cajas", "Vencimiento"]
+            )
+
+            editado = st.data_editor(
+                df_f,
+                num_rows="dynamic",
+                hide_index=True,
+                key="editor_factura",
+                column_config={
+                    "Incluir": st.column_config.CheckboxColumn("Incluir"),
+                    "Categoría": st.column_config.SelectboxColumn("Categoría", options=CATEGORIAS),
+                    "Cajas": st.column_config.NumberColumn(
+                        "Cajas", min_value=1, step=1,
+                        help="Revisa que sean cajas y no unidades sueltas."),
+                    "Vencimiento": st.column_config.DateColumn(
+                        "Vencimiento", format="DD/MM/YYYY",
+                        help="La factura casi nunca lo trae: complétalo tú."),
+                },
+            )
+
+            c_ok, c_cancel = st.columns(2)
+            confirmar_f = c_ok.button("✅ Ingresar al inventario", type="primary")
+            cancelar_f = c_cancel.button("Descartar")
+
+            if cancelar_f:
+                del st.session_state.factura
+                st.rerun()
+
+            if confirmar_f:
+                errores, nuevos = [], []
+                for i, fila in editado.iterrows():
+                    if not bool(fila["Incluir"]):
+                        continue
+                    nombre_f = str(fila["Producto"] or "").strip()
+                    if not nombre_f or nombre_f.lower() == "nan":
+                        errores.append(f"Fila {i + 1}: falta el nombre del producto.")
+                        continue
+                    if pd.isna(fila["Cajas"]) or int(fila["Cajas"]) < 1:
+                        errores.append(f"Fila {i + 1} ({nombre_f}): faltan las cajas.")
+                        continue
+                    if pd.isna(fila["Vencimiento"]):
+                        errores.append(f"Fila {i + 1} ({nombre_f}): falta la fecha de vencimiento.")
+                        continue
+                    nuevos.append({
+                        "nombre": nombre_f,
+                        "categoria": fila["Categoría"] if fila["Categoría"] in CATEGORIAS else "Otros",
+                        "cajas": int(fila["Cajas"]),
+                        "vencimiento": pd.to_datetime(fila["Vencimiento"]).date().isoformat(),
+                    })
+
+                if errores:
+                    st.error("Sea serio, faltan datos 😐\n\n" + "\n".join(f"- {e}" for e in errores))
+                elif not nuevos:
+                    st.warning("No hay filas marcadas para ingresar.")
+                else:
+                    for n in nuevos:
+                        existente = next(
+                            (l for l in st.session_state.lotes
+                             if l["nombre"].lower() == n["nombre"].lower()
+                             and l["vencimiento"] == n["vencimiento"]),
+                            None,
+                        )
+                        if existente:
+                            existente["cajas"] += n["cajas"]
+                        else:
+                            st.session_state.lotes.append({
+                                "id": uuid.uuid4().hex[:8],
+                                "nombre": n["nombre"],
+                                "categoria": n["categoria"],
+                                "cajas": n["cajas"],
+                                "vencimiento": n["vencimiento"],
+                                "proveedor": proveedor_f.strip(),
+                                "ingreso": date.today().isoformat(),
+                            })
+                    if guardar():
+                        del st.session_state.factura
+                        avisar("success", f"Factura ingresada: {len(nuevos)} productos agregados a bodega 📦")
+                        st.rerun()
 
 
 # -----------------------------------------------------
