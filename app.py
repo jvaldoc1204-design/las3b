@@ -446,8 +446,7 @@ with tab_factura:
             "vencimientos y confirmas. Nada entra hasta el botón final."
         )
         st.info(
-            "Con la clave gratuita de Gemini, Google puede usar lo que envías para "
-            "mejorar sus productos. al ser gratis la IA puede saturarse y tardar en procesar."
+            "Al ser gratis la IA puede saturarse y tardar en procesar. "
             "Si quieres algo bueno pagame la Clave de Gemini Pro Oliver"
         )
 
