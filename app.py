@@ -6,6 +6,7 @@ import random
 import uuid
 import base64
 import re
+import time
 from datetime import date, datetime, timedelta
 
 try:
@@ -492,19 +493,43 @@ def leer_factura(contenido, tipo):
         "Responde SOLO con JSON válido, sin texto adicional, con este formato exacto: "
         '{"proveedor": "", "productos": [{"nombre": "", "cantidad": 0, "categoria": ""}]}'
     )
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo_ia()}:generateContent"
-    respuesta = requests.post(
-        url,
-        headers={"x-goog-api-key": st.secrets["gemini_api_key"],
-                 "Content-Type": "application/json"},
-        json={
-            "contents": [{"parts": [parte_archivo, {"text": instrucciones}]}],
-            "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
-        },
-        timeout=120,
-    )
-    if respuesta.status_code != 200:
-        raise RuntimeError(f"Gemini respondió {respuesta.status_code}: {respuesta.text[:300]}")
+    cabeceras = {"x-goog-api-key": st.secrets["gemini_api_key"],
+                 "Content-Type": "application/json"}
+    cuerpo = {
+        "contents": [{"parts": [parte_archivo, {"text": instrucciones}]}],
+        "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
+    }
+
+    # Si un modelo está saturado, se reintenta y luego se prueba el siguiente.
+    modelos = []
+    for m in [modelo_ia(), "gemini-flash-latest", "gemini-flash-lite-latest"]:
+        if m not in modelos:
+            modelos.append(m)
+
+    TEMPORALES = (429, 500, 503, 504)
+    respuesta = None
+    ultimo_error = "sin respuesta"
+    for modelo in modelos:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent"
+        for intento in range(3):
+            respuesta = requests.post(url, headers=cabeceras, json=cuerpo, timeout=120)
+            if respuesta.status_code == 200:
+                break
+            ultimo_error = f"{modelo} -> {respuesta.status_code}: {respuesta.text[:200]}"
+            if respuesta.status_code in TEMPORALES:
+                time.sleep(2 * (intento + 1))  # espera 2, 4 y 6 segundos
+                continue
+            break
+        if respuesta.status_code == 200:
+            break
+        if respuesta.status_code not in (404,) + TEMPORALES:
+            # Clave inválida, imagen rechazada, etc.: probar otro modelo no ayuda.
+            raise RuntimeError(f"Gemini respondió {ultimo_error}")
+    if respuesta is None or respuesta.status_code != 200:
+        raise RuntimeError(
+            "Gemini está saturado o no disponible en este momento. "
+            "Intenta de nuevo en unos minutos. Último error: " + ultimo_error
+        )
     try:
         partes = respuesta.json()["candidates"][0]["content"]["parts"]
         texto = "".join(p.get("text", "") for p in partes)
@@ -525,6 +550,28 @@ with tab_factura:
             "Settings → Secrets y agrega una línea: gemini_api_key = \"tu_clave\" "
             "(la clave se crea en aistudio.google.com/apikey)."
         )
+        # Diagnóstico: solo muestra NOMBRES de claves, nunca sus valores.
+        try:
+            claves = sorted(st.secrets.keys())
+        except Exception:
+            claves = []
+        try:
+            dentro = "gemini_api_key" in st.secrets["gcp_service_account"]
+        except Exception:
+            dentro = False
+        if dentro:
+            st.error(
+                "Encontré gemini_api_key pegada DEBAJO de [gcp_service_account]. "
+                "Muévela a la primera línea de los Secrets, antes de cualquier línea "
+                "que empiece con [ y guarda."
+            )
+        elif requests is None:
+            st.error("Falta la librería 'requests': agrégala a requirements.txt en GitHub.")
+        else:
+            st.caption(
+                "Claves detectadas en Secrets: "
+                + (", ".join(claves) if claves else "ninguna (los Secrets están vacíos o no se guardaron)")
+            )
     else:
         st.caption(
             "Toma una foto de la factura (o sube un PDF). La IA arma una tabla; "
