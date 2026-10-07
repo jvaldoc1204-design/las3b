@@ -34,6 +34,49 @@ st.set_page_config(page_title="Las 3B - Bodega", page_icon="📦", layout="cente
 
 
 # -----------------------------------------------------
+#  ACCESO (contraseña = nombre de cualquiera del equipo)
+# -----------------------------------------------------
+USUARIOS_POR_DEFECTO = ["oliver", "javier", "jorge", "jefa", "jefe"]
+
+
+def usuarios_permitidos():
+    """Lista de nombres que pueden entrar. Se puede cambiar con 'usuarios' en los Secrets."""
+    try:
+        extra = st.secrets["usuarios"]
+        if isinstance(extra, str):
+            extra = [extra]
+        lista = [str(u).strip().lower() for u in extra if str(u).strip()]
+        if lista:
+            return lista
+    except Exception:
+        pass
+    return USUARIOS_POR_DEFECTO
+
+
+def pantalla_acceso():
+    """Si no hay sesión iniciada, muestra el acceso y detiene la app (no carga datos)."""
+    if st.session_state.get("usuario"):
+        return
+    st.title("📦 Las 3B · Bodega")
+    st.caption(f"Versión {VERSION}")
+    with st.form("form_acceso"):
+        clave = st.text_input("Ingrese contraseña", type="password")
+        entrar = st.form_submit_button("Entrar")
+    if entrar:
+        nombre = clave.strip().lower()
+        if nombre and nombre in usuarios_permitidos():
+            st.session_state.usuario = nombre.capitalize()
+            st.rerun()
+        else:
+            time.sleep(1)  # frena un poco los intentos al azar
+            st.error("Contraseña incorrecta. Sea serio 😐")
+    st.stop()
+
+
+pantalla_acceso()
+
+
+# -----------------------------------------------------
 #  ALMACENAMIENTO
 # -----------------------------------------------------
 CAMPOS = ["id", "nombre", "categoria", "cajas", "vencimiento", "proveedor", "ingreso"]
@@ -341,6 +384,10 @@ def elegir_archivo(clave, permitir_pdf):
 with st.sidebar:
     st.header("📦 Las 3B")
     st.caption(f"Versión {VERSION}")
+    st.caption(f"👤 {st.session_state.get('usuario', '')}")
+    if st.button("🔒 Cerrar sesión", key="salir_lateral"):
+        st.session_state.clear()
+        st.rerun()
     if usar_sheets():
         st.success("☁️ Datos guardados en Google Sheets")
     else:
@@ -351,7 +398,7 @@ with st.sidebar:
 #  ENCABEZADO
 # -----------------------------------------------------
 st.title("📦 Las 3B · Bodega")
-st.caption(f"Versión {VERSION} · ¡Sea serio! 😐")
+st.caption(f"Versión {VERSION} · Hola, {st.session_state.get('usuario', '')} 👋 · ¡Sea serio! 😐")
 
 if "aviso" in st.session_state:
     tipo, texto = st.session_state.pop("aviso")
@@ -608,7 +655,7 @@ with tab_retirar:
                 archivo_r = elegir_archivo("retiro", False)
 
                 if archivo_r is not None and st.button("🔍 Reconocer productos", key="btn_reconocer"):
-                    with st.spinner("Mirando la foto... TRANQUILOOOO"):
+                    with st.spinner("Mirando la foto..."):
                         try:
                             res = identificar_productos(
                                 archivo_r.getvalue(), archivo_r.type or "image/jpeg", productos
@@ -819,4 +866,7 @@ with tab_editar:
 #  PIE DE PÁGINA
 # -----------------------------------------------------
 st.divider()
+if st.button("🔒 Cerrar sesión", key="salir_pie"):
+    st.session_state.clear()
+    st.rerun()
 st.caption(f"Las 3B · Versión {VERSION} · Hecho con cariño · 67 🫳🫴")
