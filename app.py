@@ -6,7 +6,15 @@ import uuid
 import base64
 import re
 import time
+import copy
+import difflib
+import unicodedata
 from datetime import date, datetime, timedelta
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # sin zonas horarias se usa la fecha del servidor
+    ZoneInfo = None
 
 try:
     import requests
@@ -24,7 +32,7 @@ except ImportError:  # sin estas librerías la app funciona en modo local (JSON)
 #  INVENTARIO DE BODEGA - DISTRIBUIDORA LAS 3B
 # =====================================================
 
-VERSION = "beta 1.1"
+VERSION = "beta 1.2"
 ARCHIVO_DATOS = "inventario_las3b.json"
 CATEGORIAS = ["Aseo", "Higiene", "Abarrotes", "Lácteos", "Bebestibles", "Otros"]
 DIAS_ALERTA = 30      # "Por vencer" si faltan 30 días o menos
@@ -213,10 +221,15 @@ def nombres_productos():
     return sorted({l["nombre"] for l in st.session_state.lotes}, key=str.lower)
 
 
-def descontar_fifo(nombre, cantidad):
-    """Saca cajas de un producto, primero las que vencen antes. Devuelve el detalle."""
+def descontar_fifo(nombre, cantidad, lotes=None):
+    """Saca cajas de un producto, primero las que vencen antes. Devuelve el detalle.
+
+    Trabaja sobre la lista 'lotes' (por defecto el inventario real), modificándola en el lugar.
+    """
+    if lotes is None:
+        lotes = st.session_state.lotes
     lotes_prod = sorted(
-        [l for l in st.session_state.lotes if l["nombre"] == nombre],
+        [l for l in lotes if l["nombre"] == nombre],
         key=lambda l: l["vencimiento"],
     )
     faltan = int(cantidad)
@@ -228,7 +241,7 @@ def descontar_fifo(nombre, cantidad):
         l["cajas"] -= sacar
         faltan -= sacar
         detalle.append(f"{sacar} del lote que vence el {a_fecha(l['vencimiento']).strftime('%d/%m/%Y')}")
-    st.session_state.lotes = [l for l in st.session_state.lotes if l["cajas"] > 0]
+    lotes[:] = [l for l in lotes if l["cajas"] > 0]
     return detalle
 
 
@@ -250,11 +263,11 @@ def ia_disponible():
         return False
 
 
-def aviso_ia_no_disponible():
+def aviso_ia_no_disponible(clave="gemini_api_key", donde="aistudio.google.com/apikey"):
     st.warning(
         "Falta configurar la clave de la IA. En Streamlit Cloud entra a "
-        "Settings → Secrets y agrega una línea: gemini_api_key = \"tu_clave\" "
-        "(la clave se crea en aistudio.google.com/apikey)."
+        f"Settings → Secrets y agrega una línea: {clave} = \"tu_clave\" "
+        f"(la clave se crea en {donde})."
     )
     # Diagnóstico: solo muestra NOMBRES de claves, nunca sus valores.
     try:
@@ -262,12 +275,12 @@ def aviso_ia_no_disponible():
     except Exception:
         claves = []
     try:
-        dentro = "gemini_api_key" in st.secrets["gcp_service_account"]
+        dentro = clave in st.secrets["gcp_service_account"]
     except Exception:
         dentro = False
     if dentro:
         st.error(
-            "Encontré gemini_api_key pegada DEBAJO de [gcp_service_account]. "
+            f"Encontré {clave} pegada DEBAJO de [gcp_service_account]. "
             "Muévela a la primera línea de los Secrets, antes de cualquier línea "
             "que empiece con [ y guarda."
         )
@@ -282,12 +295,15 @@ def aviso_ia_no_disponible():
 
 def llamar_gemini(contenido, tipo, instrucciones):
     """Envía una foto/PDF + instrucciones a Gemini y devuelve la respuesta JSON como dict."""
-    datos = base64.standard_b64encode(contenido).decode("utf-8")
-    parte_archivo = {"inline_data": {"mime_type": tipo, "data": datos}}
+    partes_envio = []
+    if contenido is not None:  # sin archivo = solo texto (lo usa el asistente como respaldo)
+        datos = base64.standard_b64encode(contenido).decode("utf-8")
+        partes_envio.append({"inline_data": {"mime_type": tipo, "data": datos}})
+    partes_envio.append({"text": instrucciones})
     cabeceras = {"x-goog-api-key": st.secrets["gemini_api_key"],
                  "Content-Type": "application/json"}
     cuerpo = {
-        "contents": [{"parts": [parte_archivo, {"text": instrucciones}]}],
+        "contents": [{"parts": partes_envio}],
         "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
     }
 
@@ -364,6 +380,358 @@ def identificar_productos(contenido, tipo, nombres):
     return llamar_gemini(contenido, tipo, instrucciones)
 
 
+# -----------------------------------------------------
+#  ASISTENTE DE ÓRDENES ESCRITAS (Groq, con respaldo en Gemini)
+# -----------------------------------------------------
+def hoy_chile():
+    try:
+        if ZoneInfo is not None:
+            return datetime.now(ZoneInfo("America/Santiago")).date()
+    except Exception:
+        pass
+    return date.today()
+
+
+def normalizar(texto):
+    """Minúsculas, sin tildes ni signos: 'Coca-Cola 3L' -> 'coca cola 3l'."""
+    t = unicodedata.normalize("NFKD", str(texto or ""))
+    t = "".join(c for c in t if not unicodedata.combining(c)).lower()
+    return re.sub(r"[^a-z0-9]+", " ", t).strip()
+
+
+def resolver_producto(nombre, existentes):
+    """Busca el producto escrito entre los que ya existen. Devuelve (nombre, existe)."""
+    n = normalizar(nombre)
+    if not n:
+        return "", False
+    mapa = {}
+    for e in existentes:
+        mapa.setdefault(normalizar(e), e)
+    if n in mapa:
+        return mapa[n], True
+    if len(n) >= 3:
+        contiene = [orig for norm, orig in mapa.items() if n in norm]
+        if len(contiene) == 1:
+            return contiene[0], True
+    cercanos = difflib.get_close_matches(n, list(mapa.keys()), n=1, cutoff=0.85)
+    if cercanos:
+        return mapa[cercanos[0]], True
+    return str(nombre).strip(), False
+
+
+def sugerencias(nombre, existentes, max_n=4):
+    n = normalizar(nombre)
+    if not n:
+        return []
+    salida = [e for e in existentes if n in normalizar(e) or normalizar(e) in n]
+    for c in difflib.get_close_matches(n, [normalizar(e) for e in existentes], n=max_n, cutoff=0.5):
+        for e in existentes:
+            if normalizar(e) == c and e not in salida:
+                salida.append(e)
+    return salida[:max_n]
+
+
+def parsear_fecha(valor):
+    """Devuelve 'YYYY-MM-DD' o None si no se entiende."""
+    if not valor:
+        return None
+    try:
+        return datetime.strptime(str(valor).strip()[:10], "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        return None
+
+
+def entero_positivo(valor):
+    try:
+        n = int(float(valor))
+    except (TypeError, ValueError):
+        return None
+    return n if n >= 1 else None
+
+
+def fmt_fecha(iso):
+    return a_fecha(iso).strftime("%d/%m/%Y")
+
+
+def unir_lotes_iguales(lotes, nombre):
+    """Si un producto queda con dos lotes de la misma fecha, los junta en uno."""
+    vistos = {}
+    for l in list(lotes):
+        if l["nombre"] != nombre:
+            continue
+        if l["vencimiento"] in vistos:
+            vistos[l["vencimiento"]]["cajas"] += l["cajas"]
+            lotes.remove(l)
+        else:
+            vistos[l["vencimiento"]] = l
+
+
+def aplicar_accion(lotes, accion, hoy):
+    """Aplica UNA acción sobre la lista 'lotes' (la modifica en el lugar).
+
+    Devuelve (ok, texto, aviso). Si ok es False no se tocó nada.
+    """
+    tipo = str(accion.get("tipo") or "").strip().lower()
+    existentes = sorted({l["nombre"] for l in lotes}, key=str.lower)
+    nombre_in = str(accion.get("producto") or "").strip()
+    if not nombre_in:
+        return False, "Falta el nombre del producto.", None
+    nombre, existe = resolver_producto(nombre_in, existentes)
+
+    def no_encontrado():
+        sug = sugerencias(nombre_in, existentes)
+        extra = f" ¿Quisiste decir: {', '.join(sug)}?" if sug else ""
+        return False, f"No encontré '{nombre_in}' en bodega.{extra}", None
+
+    if tipo == "ingresar":
+        cajas = entero_positivo(accion.get("cajas"))
+        if cajas is None:
+            return False, f"{nombre}: faltan las cajas.", None
+        venc = parsear_fecha(accion.get("vencimiento"))
+        if venc is None:
+            return False, f"{nombre}: falta la fecha de vencimiento (escríbela en la orden).", None
+        if existe:
+            cat = next(l["categoria"] for l in lotes if l["nombre"] == nombre)
+        else:
+            cat = accion.get("categoria") if accion.get("categoria") in CATEGORIAS else "Otros"
+        lote = next((l for l in lotes if l["nombre"] == nombre and l["vencimiento"] == venc), None)
+        if lote:
+            lote["cajas"] += cajas
+        else:
+            lotes.append({
+                "id": uuid.uuid4().hex[:8],
+                "nombre": nombre,
+                "categoria": cat,
+                "cajas": cajas,
+                "vencimiento": venc,
+                "proveedor": str(accion.get("proveedor") or "").strip(),
+                "ingreso": hoy.isoformat(),
+            })
+        marca = "" if existe else f" (producto nuevo, {cat})"
+        aviso = "⚠️ Esa fecha ya pasó." if venc < hoy.isoformat() else None
+        return True, f"Ingresar {cajas} cajas de {nombre}{marca}, vence {fmt_fecha(venc)}", aviso
+
+    if tipo == "retirar":
+        cajas = entero_positivo(accion.get("cajas"))
+        if cajas is None:
+            return False, f"{nombre_in}: faltan las cajas a retirar.", None
+        if not existe:
+            return no_encontrado()
+        total = sum(l["cajas"] for l in lotes if l["nombre"] == nombre)
+        if cajas > total:
+            return False, f"{nombre}: pides {cajas} y solo hay {total}. Dígale que no queda 🤷", None
+        descontar_fifo(nombre, cajas, lotes)
+        return True, f"Retirar {cajas} cajas de {nombre} (quedan {total - cajas})", None
+
+    if tipo == "cambiar_vencimiento":
+        if not existe:
+            return no_encontrado()
+        nuevo = parsear_fecha(accion.get("vencimiento"))
+        if nuevo is None:
+            return False, f"{nombre}: falta la nueva fecha de vencimiento.", None
+        lotes_p = sorted([l for l in lotes if l["nombre"] == nombre], key=lambda l: l["vencimiento"])
+        actual = parsear_fecha(accion.get("vencimiento_actual"))
+        if actual:
+            objetivo = next((l for l in lotes_p if l["vencimiento"] == actual), None)
+            if objetivo is None:
+                return False, f"{nombre}: no hay un lote que venza el {fmt_fecha(actual)}.", None
+        elif len(lotes_p) == 1:
+            objetivo = lotes_p[0]
+        else:
+            fechas = ", ".join(fmt_fecha(l["vencimiento"]) for l in lotes_p)
+            return False, f"{nombre} tiene varios lotes ({fechas}): indica cuál quieres cambiar.", None
+        anterior = objetivo["vencimiento"]
+        if anterior == nuevo:
+            return False, f"{nombre} ya vence el {fmt_fecha(nuevo)}.", None
+        otro = next((l for l in lotes_p if l is not objetivo and l["vencimiento"] == nuevo), None)
+        if otro:
+            otro["cajas"] += objetivo["cajas"]
+            lotes.remove(objetivo)
+        else:
+            objetivo["vencimiento"] = nuevo
+        aviso = "⚠️ Esa fecha ya pasó." if nuevo < hoy.isoformat() else None
+        return True, f"Cambiar vencimiento de {nombre}: {fmt_fecha(anterior)} → {fmt_fecha(nuevo)}", aviso
+
+    if tipo == "renombrar":
+        if not existe:
+            return no_encontrado()
+        nuevo_nombre = str(accion.get("nuevo_nombre") or "").strip()
+        if not nuevo_nombre:
+            return False, f"{nombre}: falta el nombre nuevo.", None
+        if nuevo_nombre == nombre:
+            return False, f"'{nombre}' ya se llama así.", None
+        destino = next(
+            (e for e in existentes if e != nombre and normalizar(e) == normalizar(nuevo_nombre)), None
+        )
+        final = destino or nuevo_nombre
+        for l in lotes:
+            if l["nombre"] == nombre:
+                l["nombre"] = final
+        unir_lotes_iguales(lotes, final)
+        union = " (se une al producto que ya existía)" if destino else ""
+        return True, f"Renombrar '{nombre}' → '{final}'{union}", None
+
+    return False, f"No entendí qué hacer con '{nombre_in}' (acción '{tipo}').", None
+
+
+def planificar(acciones, lotes_reales, hoy):
+    """Prueba cada acción sobre una COPIA del inventario. Aquí no se guarda nada."""
+    copia = copy.deepcopy(lotes_reales)
+    plan = []
+    for a in acciones[:20]:
+        if not isinstance(a, dict):
+            continue
+        ok, texto, aviso = aplicar_accion(copia, a, hoy)
+        plan.append({"accion": a, "ok": ok, "texto": texto, "aviso": aviso})
+    return plan
+
+
+def resumen_inventario(lotes):
+    por = {}
+    for l in lotes:
+        p = por.setdefault(l["nombre"], {"producto": l["nombre"], "categoria": l["categoria"],
+                                         "cajas_total": 0, "lotes": []})
+        p["cajas_total"] += l["cajas"]
+        p["lotes"].append({"vence": l["vencimiento"], "cajas": l["cajas"]})
+    for p in por.values():
+        p["lotes"].sort(key=lambda x: x["vence"])
+    return sorted(por.values(), key=lambda p: p["producto"].lower())
+
+
+def groq_disponible():
+    try:
+        return requests is not None and "groq_api_key" in st.secrets
+    except Exception:
+        return False
+
+
+def asistente_disponible():
+    return groq_disponible() or ia_disponible()
+
+
+def modelo_groq():
+    """Modelo preferido de Groq. Se puede cambiar con 'groq_model' en los Secrets."""
+    try:
+        return st.secrets["groq_model"]
+    except Exception:
+        return None
+
+
+def extraer_json(texto):
+    encontrado = re.search(r"\{.*\}", texto or "", re.S)
+    if not encontrado:
+        raise ValueError("La IA no devolvió datos legibles.")
+    try:
+        return json.loads(encontrado.group(0))
+    except json.JSONDecodeError:
+        raise ValueError("La IA devolvió una respuesta que no pude entender. Prueba con otras palabras.")
+
+
+def llamar_groq(sistema, usuario):
+    """Pide a Groq una respuesta en JSON. Reintenta y prueba otros modelos si hace falta."""
+    cabeceras = {"Authorization": f"Bearer {st.secrets['groq_api_key']}",
+                 "Content-Type": "application/json"}
+    modelos = []
+    for m in [modelo_groq(), "llama-3.3-70b-versatile", "openai/gpt-oss-120b", "llama-3.1-8b-instant"]:
+        if m and m not in modelos:
+            modelos.append(m)
+
+    TEMPORALES = (429, 500, 502, 503, 504)
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    respuesta = None
+    ultimo_error = "sin respuesta"
+    for modelo in modelos:
+        cuerpo = {
+            "model": modelo,
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+            "messages": [{"role": "system", "content": sistema},
+                         {"role": "user", "content": usuario}],
+        }
+        for intento in range(2):
+            respuesta = requests.post(url, headers=cabeceras, json=cuerpo, timeout=60)
+            if respuesta.status_code == 200:
+                break
+            ultimo_error = f"{modelo} -> {respuesta.status_code}: {respuesta.text[:200]}"
+            if respuesta.status_code in TEMPORALES:
+                time.sleep(2 * (intento + 1))
+                continue
+            break
+        if respuesta.status_code == 200:
+            break
+        if respuesta.status_code in (401, 403):
+            raise RuntimeError(f"Groq rechazó la clave ({respuesta.status_code}). Revisa groq_api_key en los Secrets.")
+        # Otros errores (modelo no disponible, saturación...): se prueba el siguiente modelo.
+    if respuesta is None or respuesta.status_code != 200:
+        raise RuntimeError("Groq no respondió. Último error: " + ultimo_error)
+    try:
+        texto = respuesta.json()["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError, ValueError):
+        raise ValueError("Groq no devolvió texto.")
+    return extraer_json(texto)
+
+
+def llamar_llm_texto(sistema, usuario):
+    """Usa Groq si hay clave; si falla (o no hay), prueba Gemini. Devuelve (resultado, proveedor)."""
+    errores = []
+    if groq_disponible():
+        try:
+            return llamar_groq(sistema, usuario), "Groq"
+        except Exception as e:
+            errores.append(f"Groq: {e}")
+    if ia_disponible():
+        try:
+            return llamar_gemini(None, None, sistema + "\n\n" + usuario), "Gemini"
+        except Exception as e:
+            errores.append(f"Gemini: {e}")
+    raise RuntimeError(" | ".join(errores) or "No hay ninguna clave de IA configurada.")
+
+
+def interpretar_orden(texto, lotes):
+    hoy = hoy_chile()
+    sistema = (
+        "Eres el asistente de bodega de la distribuidora Las 3B (Chile). "
+        "Conviertes órdenes escritas por el personal en acciones sobre el inventario. "
+        "Responde SOLO con un objeto JSON, sin texto adicional, con esta forma exacta: "
+        '{"acciones": [{"tipo": "", "producto": "", "cajas": 0, "vencimiento": null, '
+        '"vencimiento_actual": null, "categoria": "", "proveedor": "", "nuevo_nombre": ""}], '
+        '"respuesta": ""}\n\n'
+        "Tipos de acción:\n"
+        '- "ingresar": llegó mercadería (llegaron, entraron, ingresa, agrega, recibí). '
+        "Campos: producto, cajas, vencimiento, categoria, proveedor.\n"
+        '- "retirar": se saca mercadería de bodega (saca, bajé, descuenta, salieron, despaché). '
+        "Campos: producto, cajas.\n"
+        '- "cambiar_vencimiento": corregir la fecha de un lote que ya existe. Campos: producto, '
+        "vencimiento (la fecha NUEVA) y vencimiento_actual (la fecha vieja, solo si la orden la dice; si no, null).\n"
+        '- "renombrar": cambiar el nombre de un producto. Campos: producto (nombre actual), nuevo_nombre.\n\n'
+        "Reglas:\n"
+        "1. Si la orden se refiere a algo que ya existe, usa EXACTAMENTE el nombre del inventario, "
+        "aunque el usuario lo escriba abreviado, sin tildes o con otras mayúsculas. "
+        'Un nombre nuevo solo en "ingresar" y solo si el producto claramente no existe.\n'
+        "2. Las cantidades son cajas.\n"
+        f"3. Fechas en formato YYYY-MM-DD. Hoy es {hoy.isoformat()}. En Chile las fechas se escriben día/mes/año. "
+        "Si solo dan mes y año (ej. 'marzo 2027' o '03/2027') usa el último día de ese mes. "
+        "Si dicen 'en 6 meses' calcúlalo desde hoy.\n"
+        '4. NUNCA inventes una fecha de vencimiento: si en un "ingresar" no la dicen, pon null.\n'
+        "5. categoria debe ser una de: " + ", ".join(CATEGORIAS) + ". Elige la más lógica para productos nuevos.\n"
+        "6. Si la orden es una pregunta sobre el inventario (cuántas cajas hay, qué vence pronto, etc.), "
+        'deja "acciones" vacío y responde en "respuesta" usando SOLO los datos del inventario entregado. '
+        "Si el dato no está, dilo.\n"
+        '7. Si la orden es confusa o falta información importante (producto o cantidad), deja "acciones" vacío '
+        'y en "respuesta" pregunta qué falta.\n'
+        "8. Una orden puede traer varias acciones: devuélvelas todas, en el orden en que se dijeron.\n"
+        "9. No agregues acciones que no se pidieron."
+    )
+    usuario = json.dumps(
+        {"hoy": hoy.isoformat(), "inventario": resumen_inventario(lotes), "orden": texto[:600]},
+        ensure_ascii=False,
+    )
+    resultado, proveedor = llamar_llm_texto(sistema, usuario)
+    if not isinstance(resultado, dict):
+        raise ValueError("La IA devolvió algo inesperado.")
+    return resultado, proveedor
+
+
 def elegir_archivo(clave, permitir_pdf):
     """Pide una foto (o PDF). En el celular, 'Subir o tomar foto' abre la cámara trasera."""
     origen = st.radio(
@@ -412,11 +780,12 @@ st.markdown(
     f"🟡 {por_vencer} por vencer · 🔴 {vencidos} vencidos"
 )
 
-(tab_inventario, tab_factura, tab_retirar,
+(tab_inventario, tab_factura, tab_retirar, tab_asistente,
  tab_venc, tab_ingresar, tab_editar) = st.tabs([
     "📦 Inventario",
     "🧾 Factura",
     "📤 Retirar",
+    "🤖 Asistente",
     "⏰ Vencimientos",
     "➕ Ingresar",
     "✏️ Editar",
@@ -493,8 +862,8 @@ with tab_factura:
             "vencimientos y confirmas. Nada entra hasta el botón final."
         )
         st.info(
-            "Al ser gratis la IA puede saturarse y tardar en procesar. "
-            "Si quieres algo bueno pagame la Clave de Gemini Pro Oliver"
+            "Con la clave gratuita de Gemini, Google puede usar lo que envías para "
+            "mejorar sus productos. No subas facturas con datos que no quieras compartir."
         )
 
         archivo = elegir_archivo("factura", True)
@@ -736,7 +1105,101 @@ with tab_retirar:
 
 
 # -----------------------------------------------------
-#  4. VENCIMIENTOS (por defecto solo lo que importa)
+#  4. ASISTENTE (órdenes escritas)
+# -----------------------------------------------------
+with tab_asistente:
+    st.subheader("Asistente 🤖")
+
+    if not asistente_disponible():
+        aviso_ia_no_disponible("groq_api_key", "console.groq.com/keys")
+    else:
+        st.caption(
+            "Escribe lo que pasó en la bodega, como se lo dirías a alguien. "
+            "Te muestro lo que entendí y solo se guarda si confirmas."
+        )
+        with st.expander("Ejemplos de órdenes"):
+            st.markdown(
+                "- *Llegaron 10 cajas de leche entera que vencen el 15/03/2027*\n"
+                "- *Saca 3 cajas de Super 8 y 2 de Coca-Cola*\n"
+                "- *El Chocman vence el 20 de mayo de 2027*\n"
+                "- *Cambia el nombre de Muibon 50g a Muibon*\n"
+                "- *¿Cuántas cajas de arroz quedan?* o *¿qué vence este mes?*"
+            )
+
+        n_asist = st.session_state.get("asist_n", 0)
+        with st.form(f"form_asistente_{n_asist}"):
+            orden = st.text_area(
+                "Orden:", height=100, key=f"asist_texto_{n_asist}",
+                placeholder="Ej: llegaron 8 cajas de Super 8 que vencen en marzo de 2027",
+            )
+            interpretar = st.form_submit_button("🤖 Interpretar")
+
+        if interpretar:
+            if not orden.strip():
+                st.warning("Escribe una orden primero 😐")
+            else:
+                with st.spinner("Pensando..."):
+                    try:
+                        res, quien = interpretar_orden(orden.strip(), st.session_state.lotes)
+                        st.session_state.asist = {"orden": orden.strip(), "res": res, "quien": quien}
+                    except Exception as e:
+                        st.session_state.pop("asist", None)
+                        st.error(f"No pude interpretar la orden: {e}")
+
+        if "asist" in st.session_state:
+            datos_a = st.session_state.asist
+            respuesta_a = str(datos_a["res"].get("respuesta") or "").strip()
+            acciones_a = datos_a["res"].get("acciones") or []
+            if not isinstance(acciones_a, list):
+                acciones_a = []
+
+            st.divider()
+            st.caption(f"Orden: «{datos_a['orden']}» · interpretada con {datos_a['quien']}")
+            if respuesta_a:
+                st.info(respuesta_a)
+                if not acciones_a:
+                    st.caption("Respuesta de la IA según el inventario. Si es importante, confírmala en 📦 Inventario.")
+
+            validas_a = []
+            if acciones_a:
+                hoy_a = hoy_chile()
+                plan_a = planificar(acciones_a, st.session_state.lotes, hoy_a)
+                st.write("**Esto es lo que entendí:**")
+                for item in plan_a:
+                    st.markdown(f"{'✅' if item['ok'] else '❌'} {item['texto']}")
+                    if item["aviso"]:
+                        st.caption(item["aviso"])
+                validas_a = [i for i in plan_a if i["ok"]]
+                if not validas_a:
+                    st.warning("Ninguna acción se puede aplicar. Corrige la orden y vuelve a interpretarla.")
+            elif not respuesta_a:
+                st.warning("No entendí la orden. Prueba escribiéndola de otra forma.")
+
+            b_ok, b_no = st.columns(2)
+            confirmar_a = b_ok.button(
+                f"✅ Confirmar ({len(validas_a)})", type="primary",
+                disabled=not validas_a, key="asist_ok",
+            )
+            descartar_a = b_no.button("Descartar", key="asist_no")
+
+            if descartar_a:
+                del st.session_state.asist
+                st.rerun()
+
+            if confirmar_a and validas_a:
+                for item in validas_a:
+                    aplicar_accion(st.session_state.lotes, item["accion"], hoy_a)
+                if guardar():
+                    quien_usuario = st.session_state.get("usuario", "")
+                    resumen_a = "; ".join(i["texto"] for i in validas_a)
+                    del st.session_state.asist
+                    st.session_state.asist_n = n_asist + 1
+                    avisar("success", f"Listo{', ' + quien_usuario if quien_usuario else ''} 👍 {resumen_a}.")
+                    st.rerun()
+
+
+# -----------------------------------------------------
+#  5. VENCIMIENTOS (por defecto solo lo que importa)
 # -----------------------------------------------------
 with tab_venc:
     if not lotes:
@@ -770,11 +1233,10 @@ with tab_ingresar:
         nombre = st.text_input("Nombre del producto:")
         categoria = st.selectbox("Categoría:", CATEGORIAS)
         cajas = st.number_input("Cajas que llegaron:", min_value=1, step=1)
-        vencimiento = st.date_input(
-            "Fecha de vencimiento:",
-            value=date.today() + timedelta(days=180),
-            format="DD/MM/YYYY",
-        )
+        try:
+            vencimiento = st.date_input("Fecha de vencimiento:", value=None, format="DD/MM/YYYY")
+        except Exception:  # versiones viejas de Streamlit no permiten dejarla vacía
+            vencimiento = st.date_input("Fecha de vencimiento:", value=date.today(), format="DD/MM/YYYY")
         proveedor = st.text_input("Proveedor (opcional):", placeholder="Ej: McKay")
 
         enviar = st.form_submit_button("Agregar a bodega")
@@ -782,6 +1244,8 @@ with tab_ingresar:
         if enviar:
             if not nombre.strip():
                 st.error("Sea serio: falta el nombre del producto 😐")
+            elif vencimiento is None:
+                st.error("Falta la fecha de vencimiento 📅")
             else:
                 nombre_limpio = nombre.strip()
                 venc_txt = vencimiento.isoformat()
