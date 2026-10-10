@@ -9,6 +9,7 @@ import time
 import copy
 import difflib
 import unicodedata
+import hashlib
 from datetime import date, datetime, timedelta
 
 try:
@@ -32,7 +33,7 @@ except ImportError:  # sin estas librerías la app funciona en modo local (JSON)
 #  INVENTARIO DE BODEGA - DISTRIBUIDORA LAS 3B
 # =====================================================
 
-VERSION = "beta 1.2"
+VERSION = "beta 1.3"
 ARCHIVO_DATOS = "inventario_las3b.json"
 CATEGORIAS = ["Aseo", "Higiene", "Abarrotes", "Lácteos", "Bebestibles", "Otros"]
 DIAS_ALERTA = 30      # "Por vencer" si faltan 30 días o menos
@@ -365,23 +366,8 @@ def leer_factura(contenido, tipo):
     return llamar_gemini(contenido, tipo, instrucciones)
 
 
-def identificar_productos(contenido, tipo, nombres):
-    instrucciones = (
-        "Esta foto muestra productos o cajas de una bodega de distribuidora. "
-        "Estos son los productos que existen en el inventario: "
-        + json.dumps(nombres, ensure_ascii=False) + ". "
-        "Identifica cuáles de ellos aparecen en la foto (por etiqueta, marca o empaque) "
-        "y cuenta cuántas cajas o bultos de cada uno se ven. "
-        "Usa EXACTAMENTE el nombre que aparece en la lista. "
-        "Si un producto de la foto no está en la lista, ignóralo. No inventes nada. "
-        "Responde SOLO con JSON válido, sin texto adicional, con este formato exacto: "
-        '{"productos": [{"nombre": "", "cantidad": 0}]}'
-    )
-    return llamar_gemini(contenido, tipo, instrucciones)
-
-
 # -----------------------------------------------------
-#  ASISTENTE DE ÓRDENES ESCRITAS (Groq, con respaldo en Gemini)
+#  ASISTENTE DE ÓRDENES (texto y voz; Groq, con respaldo en Gemini)
 # -----------------------------------------------------
 def hoy_chile():
     try:
@@ -687,6 +673,80 @@ def llamar_llm_texto(sistema, usuario):
     raise RuntimeError(" | ".join(errores) or "No hay ninguna clave de IA configurada.")
 
 
+EXTENSIONES_AUDIO = {
+    "audio/wav": "wav", "audio/x-wav": "wav", "audio/wave": "wav", "audio/webm": "webm",
+    "audio/ogg": "ogg", "audio/mpeg": "mp3", "audio/mp4": "m4a", "audio/x-m4a": "m4a",
+}
+
+
+def transcribir_groq(contenido, tipo, pista):
+    """Voz a texto con Whisper de Groq. 'pista' ayuda a acertar los nombres de productos."""
+    url = "https://api.groq.com/openai/v1/audio/transcriptions"
+    cabeceras = {"Authorization": f"Bearer {st.secrets['groq_api_key']}"}
+    nombre_archivo = "audio." + EXTENSIONES_AUDIO.get((tipo or "").lower(), "wav")
+    TEMPORALES = (429, 500, 502, 503, 504)
+    respuesta = None
+    ultimo_error = "sin respuesta"
+    for modelo in ["whisper-large-v3-turbo", "whisper-large-v3"]:
+        for intento in range(2):
+            respuesta = requests.post(
+                url,
+                headers=cabeceras,
+                files={"file": (nombre_archivo, contenido, tipo or "audio/wav")},
+                data={"model": modelo, "language": "es", "response_format": "json",
+                      "temperature": "0", "prompt": pista},
+                timeout=60,
+            )
+            if respuesta.status_code == 200:
+                break
+            ultimo_error = f"{modelo} -> {respuesta.status_code}: {respuesta.text[:200]}"
+            if respuesta.status_code in TEMPORALES:
+                time.sleep(2 * (intento + 1))
+                continue
+            break
+        if respuesta.status_code == 200:
+            break
+        if respuesta.status_code in (401, 403):
+            raise RuntimeError(f"Groq rechazó la clave ({respuesta.status_code}). Revisa groq_api_key en los Secrets.")
+    if respuesta is None or respuesta.status_code != 200:
+        raise RuntimeError("Groq no pudo transcribir. Último error: " + ultimo_error)
+    try:
+        texto = str(respuesta.json().get("text") or "").strip()
+    except (ValueError, AttributeError):
+        texto = ""
+    if not texto:
+        raise ValueError("No se escuchó nada.")
+    return texto
+
+
+def transcribir_audio(contenido, tipo, nombres):
+    """Convierte un audio en texto. Devuelve (texto, proveedor): Groq primero, Gemini de respaldo."""
+    if not contenido or len(contenido) < 6000:
+        raise ValueError("El audio es muy corto o no se escuchó nada. Acerca el micrófono e inténtalo de nuevo.")
+    pista = ("Bodega de una distribuidora en Chile. Productos: " + ", ".join(nombres))[:600]
+    errores = []
+    if groq_disponible():
+        try:
+            return transcribir_groq(contenido, tipo, pista), "Groq"
+        except Exception as e:
+            errores.append(f"Groq: {e}")
+    if ia_disponible():
+        try:
+            r = llamar_gemini(
+                contenido, tipo or "audio/wav",
+                "Transcribe fielmente este audio en español de Chile. Es una orden hablada en una bodega "
+                "de distribuidora (productos, cajas, fechas). " + pista + " "
+                'Responde SOLO con JSON: {"texto": ""}. Si no se entiende nada, deja texto vacío.',
+            )
+            texto = str(r.get("texto") or "").strip()
+            if texto:
+                return texto, "Gemini"
+            errores.append("Gemini: no entendió el audio")
+        except Exception as e:
+            errores.append(f"Gemini: {e}")
+    raise RuntimeError(" | ".join(errores) or "No hay ninguna clave de IA configurada.")
+
+
 def interpretar_orden(texto, lotes):
     hoy = hoy_chile()
     sistema = (
@@ -732,17 +792,10 @@ def interpretar_orden(texto, lotes):
     return resultado, proveedor
 
 
-def elegir_archivo(clave, permitir_pdf):
-    """Pide una foto (o PDF). En el celular, 'Subir o tomar foto' abre la cámara trasera."""
-    origen = st.radio(
-        "Origen:", ["Subir o tomar foto", "Cámara directa"],
-        horizontal=True, key=f"origen_{clave}",
-    )
-    if origen == "Cámara directa":
-        return st.camera_input("Toma la foto", key=f"cam_{clave}")
-    tipos = ["jpg", "jpeg", "png", "webp"] + (["pdf"] if permitir_pdf else [])
+def elegir_archivo(clave):
+    """Pide una foto o PDF. En el celular, el selector ofrece sacar la foto con la cámara."""
     return st.file_uploader(
-        "Foto o PDF" if permitir_pdf else "Foto", type=tipos, key=f"up_{clave}"
+        "Foto o PDF de la factura", type=["jpg", "jpeg", "png", "webp", "pdf"], key=f"up_{clave}"
     )
 
 
@@ -780,13 +833,13 @@ st.markdown(
     f"🟡 {por_vencer} por vencer · 🔴 {vencidos} vencidos"
 )
 
-(tab_inventario, tab_factura, tab_retirar, tab_asistente,
- tab_venc, tab_ingresar, tab_editar) = st.tabs([
+(tab_asistente, tab_inventario, tab_factura, tab_venc,
+ tab_retirar, tab_ingresar, tab_editar) = st.tabs([
+    "🤖 Asistente",
     "📦 Inventario",
     "🧾 Factura",
-    "📤 Retirar",
-    "🤖 Asistente",
     "⏰ Vencimientos",
+    "📤 Retirar",
     "➕ Ingresar",
     "✏️ Editar",
 ])
@@ -797,7 +850,7 @@ st.markdown(
 # -----------------------------------------------------
 with tab_inventario:
     if not lotes:
-        st.info("La bodega está vacía. Ingresa mercadería con la pestaña 🧾 Factura o ➕ Ingresar.")
+        st.info("La bodega está vacía. Ingresa mercadería hablándole al 🤖 Asistente o con 🧾 Factura.")
     else:
         busqueda = st.text_input("🔎 Buscar producto", key="inv_busqueda")
         df = tabla_lotes(lotes)
@@ -866,7 +919,7 @@ with tab_factura:
             "mejorar sus productos. No subas facturas con datos que no quieras compartir."
         )
 
-        archivo = elegir_archivo("factura", True)
+        archivo = elegir_archivo("factura")
 
         if archivo is not None and st.button("🔍 Leer factura"):
             with st.spinner("Leyendo la factura..."):
@@ -1011,101 +1064,9 @@ with tab_retirar:
                     avisar("success", f"Retiradas {int(retirar)} cajas de '{producto}': " + "; ".join(detalle) + ".")
                     st.rerun()
 
-        # ---------- Prueba beta: reconocer productos con la cámara ----------
-        st.divider()
-        with st.expander("🧪 Escanear productos a retirar (prueba beta)"):
-            st.caption(
-                "Fotografía los productos que vas a sacar. La IA intenta reconocerlos y "
-                "contarlos; tú corriges antes de confirmar. Es una prueba: no te fíes a ciegas."
-            )
-            if not ia_disponible():
-                aviso_ia_no_disponible()
-            else:
-                archivo_r = elegir_archivo("retiro", False)
-
-                if archivo_r is not None and st.button("🔍 Reconocer productos", key="btn_reconocer"):
-                    with st.spinner("Mirando la foto..."):
-                        try:
-                            res = identificar_productos(
-                                archivo_r.getvalue(), archivo_r.type or "image/jpeg", productos
-                            )
-                            st.session_state.retiro_scan = res.get("productos", [])
-                            st.session_state.retiro_n = st.session_state.get("retiro_n", 0) + 1
-                        except Exception as e:
-                            st.error(f"No pude reconocer los productos: {e}")
-
-                if "retiro_scan" in st.session_state:
-                    filas_r = []
-                    for p in st.session_state.retiro_scan:
-                        nombre_p = p.get("nombre")
-                        if nombre_p not in productos:
-                            continue
-                        try:
-                            cant_p = max(int(float(p.get("cantidad") or 1)), 1)
-                        except (TypeError, ValueError):
-                            cant_p = 1
-                        filas_r.append({"Producto": nombre_p, "Cajas": cant_p})
-                    df_r = pd.DataFrame(filas_r, columns=["Producto", "Cajas"])
-
-                    if not filas_r:
-                        st.warning("No reconocí productos del inventario. Puedes agregar filas a mano.")
-                    st.write("**Revisa y corrige** (puedes agregar o borrar filas):")
-                    editado_r = st.data_editor(
-                        df_r,
-                        num_rows="dynamic",
-                        hide_index=True,
-                        key=f"editor_retiro_{st.session_state.get('retiro_n', 0)}",
-                        column_config={
-                            "Producto": st.column_config.SelectboxColumn("Producto", options=productos),
-                            "Cajas": st.column_config.NumberColumn("Cajas", min_value=1, step=1),
-                        },
-                    )
-
-                    r_ok, r_cancel = st.columns(2)
-                    confirmar_r = r_ok.button("✅ Retirar", type="primary", key="btn_retirar_scan")
-                    cancelar_r = r_cancel.button("Descartar", key="btn_descartar_scan")
-
-                    if cancelar_r:
-                        del st.session_state.retiro_scan
-                        st.rerun()
-
-                    if confirmar_r:
-                        pedidos, errores_r = {}, []
-                        for i, fila in editado_r.iterrows():
-                            nombre_p = fila["Producto"]
-                            if pd.isna(nombre_p) or not str(nombre_p).strip():
-                                errores_r.append(f"Fila {i + 1}: elige el producto.")
-                                continue
-                            if pd.isna(fila["Cajas"]) or int(fila["Cajas"]) < 1:
-                                errores_r.append(f"Fila {i + 1} ({nombre_p}): faltan las cajas.")
-                                continue
-                            pedidos[nombre_p] = pedidos.get(nombre_p, 0) + int(fila["Cajas"])
-                        for nombre_p, cant_p in pedidos.items():
-                            disponible = sum(
-                                l["cajas"] for l in st.session_state.lotes if l["nombre"] == nombre_p
-                            )
-                            if cant_p > disponible:
-                                errores_r.append(
-                                    f"{nombre_p}: pides {cant_p} y solo quedan {disponible}. "
-                                    "Dígale que no queda 🤷"
-                                )
-
-                        if errores_r:
-                            st.error("\n".join(f"- {e}" for e in errores_r))
-                        elif not pedidos:
-                            st.warning("No hay nada para retirar.")
-                        else:
-                            for nombre_p, cant_p in pedidos.items():
-                                descontar_fifo(nombre_p, cant_p)
-                            if guardar():
-                                del st.session_state.retiro_scan
-                                resumen_r = ", ".join(f"{c} de {n}" for n, c in pedidos.items())
-                                avisar("success", f"Retirado: {resumen_r}.")
-                                st.rerun()
-
 
 # -----------------------------------------------------
-#  4. ASISTENTE (órdenes escritas)
+#  ASISTENTE (voz y texto) - pestaña principal
 # -----------------------------------------------------
 with tab_asistente:
     st.subheader("Asistente 🤖")
@@ -1114,7 +1075,7 @@ with tab_asistente:
         aviso_ia_no_disponible("groq_api_key", "console.groq.com/keys")
     else:
         st.caption(
-            "Escribe lo que pasó en la bodega, como se lo dirías a alguien. "
+            "Habla o escribe lo que pasó en la bodega, como se lo dirías a alguien. "
             "Te muestro lo que entendí y solo se guarda si confirmas."
         )
         with st.expander("Ejemplos de órdenes"):
@@ -1127,12 +1088,38 @@ with tab_asistente:
             )
 
         n_asist = st.session_state.get("asist_n", 0)
-        with st.form(f"form_asistente_{n_asist}"):
-            orden = st.text_area(
-                "Orden:", height=100, key=f"asist_texto_{n_asist}",
-                placeholder="Ej: llegaron 8 cajas de Super 8 que vencen en marzo de 2027",
+        tiene_voz = hasattr(st, "audio_input")
+
+        if tiene_voz:
+            audio = st.audio_input(
+                "🎤 Toca para hablar y toca de nuevo para terminar",
+                key=f"asist_audio_{n_asist}",
             )
-            interpretar = st.form_submit_button("🤖 Interpretar")
+            if audio is not None:
+                datos_audio = audio.getvalue()
+                huella = hashlib.md5(datos_audio).hexdigest()
+                if st.session_state.get("asist_audio_huella") != huella:
+                    st.session_state.asist_audio_huella = huella  # así el mismo audio no se procesa dos veces
+                    with st.spinner("Escuchando..."):
+                        try:
+                            texto_voz, _ = transcribir_audio(
+                                datos_audio, getattr(audio, "type", None), nombres_productos()
+                            )
+                            res, quien = interpretar_orden(texto_voz, st.session_state.lotes)
+                            st.session_state.asist = {
+                                "orden": texto_voz, "res": res, "quien": quien, "voz": True,
+                            }
+                        except Exception as e:
+                            st.session_state.pop("asist", None)
+                            st.error(f"No pude entender el audio: {e}")
+
+        with st.expander("⌨️ Escribir la orden", expanded=not tiene_voz):
+            with st.form(f"form_asistente_{n_asist}"):
+                orden = st.text_area(
+                    "Orden:", height=100, key=f"asist_texto_{n_asist}",
+                    placeholder="Ej: llegaron 8 cajas de Super 8 que vencen en marzo de 2027",
+                )
+                interpretar = st.form_submit_button("🤖 Interpretar")
 
         if interpretar:
             if not orden.strip():
@@ -1154,7 +1141,10 @@ with tab_asistente:
                 acciones_a = []
 
             st.divider()
-            st.caption(f"Orden: «{datos_a['orden']}» · interpretada con {datos_a['quien']}")
+            st.caption(
+                f"{'🎤 Escuché' if datos_a.get('voz') else 'Orden'}: «{datos_a['orden']}» "
+                f"· interpretada con {datos_a['quien']}"
+            )
             if respuesta_a:
                 st.info(respuesta_a)
                 if not acciones_a:
@@ -1184,6 +1174,7 @@ with tab_asistente:
 
             if descartar_a:
                 del st.session_state.asist
+                st.session_state.asist_n = n_asist + 1
                 st.rerun()
 
             if confirmar_a and validas_a:
