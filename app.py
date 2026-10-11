@@ -39,13 +39,29 @@ CATEGORIAS = ["Aseo", "Higiene", "Abarrotes", "Lácteos", "Bebestibles", "Otros"
 DIAS_ALERTA = 30      # "Por vencer" si faltan 30 días o menos
 DIAS_URGENTE = 7      # "Urgente" si faltan 7 días o menos
 
-st.set_page_config(page_title="Las 3B - Bodega", page_icon="📦", layout="centered")
+import os as _os
+_LOGO = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "logo.jpg")
+_HAY_LOGO = _os.path.exists(_LOGO)
+
+st.set_page_config(page_title="Las 3B - Bodega", page_icon=_LOGO if _HAY_LOGO else "📦", layout="centered")
+
+
+def encabezado(subtitulo):
+    """Logo + título (si no está el archivo logo.jpg, usa solo el título)."""
+    if _HAY_LOGO:
+        c_logo, c_txt = st.columns([1, 4], vertical_alignment="center")
+        c_logo.image(_LOGO, width=90)
+        c_txt.title("Bodega")
+        c_txt.caption(subtitulo)
+    else:
+        st.title("📦 Las 3B · Bodega")
+        st.caption(subtitulo)
 
 
 # -----------------------------------------------------
 #  ACCESO (contraseña = nombre de cualquiera del equipo)
 # -----------------------------------------------------
-USUARIOS_POR_DEFECTO = ["oliver", "javier", "jorge", "jefa", "jefe", "esteban"]
+USUARIOS_POR_DEFECTO = ["oliver", "javier", "jorge", "jefa", "jefe"]
 
 
 def usuarios_permitidos():
@@ -66,8 +82,7 @@ def pantalla_acceso():
     """Si no hay sesión iniciada, muestra el acceso y detiene la app (no carga datos)."""
     if st.session_state.get("usuario"):
         return
-    st.title("📦 Las 3B · Bodega")
-    st.caption(f"Versión {VERSION}")
+    encabezado(f"Versión {VERSION}")
     with st.form("form_acceso"):
         clave = st.text_input("Ingrese contraseña", type="password")
         entrar = st.form_submit_button("Entrar")
@@ -818,8 +833,7 @@ with st.sidebar:
 # -----------------------------------------------------
 #  ENCABEZADO
 # -----------------------------------------------------
-st.title("📦 Las 3B · Bodega")
-st.caption(f"Versión {VERSION} · Hola, {st.session_state.get('usuario', '')} 👋 · ¡Sea serio! 😐")
+encabezado(f"Versión {VERSION} · Hola, {st.session_state.get('usuario', '')} 👋 · ¡Sea serio! 😐")
 
 if "aviso" in st.session_state:
     tipo, texto = st.session_state.pop("aviso")
