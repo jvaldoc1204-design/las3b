@@ -45,7 +45,7 @@ st.set_page_config(page_title="Las 3B - Bodega", page_icon="📦", layout="cente
 # -----------------------------------------------------
 #  ACCESO (contraseña = nombre de cualquiera del equipo)
 # -----------------------------------------------------
-USUARIOS_POR_DEFECTO = ["oliver", "javier", "jorge", "jefa", "jefe"]
+USUARIOS_POR_DEFECTO = ["oliver", "javier", "jorge", "jefa", "jefe", "esteban"]
 
 
 def usuarios_permitidos():
