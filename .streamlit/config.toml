@@ -1,0 +1,17 @@
+# Tema de Las 3B (claro, alto contraste, pensado para usar en celular)
+[theme]
+base = "light"
+primaryColor = "#1E6FD9"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#EEF3FA"
+textColor = "#1B2430"
+font = "sans serif"
+
+# --- Alternativa oscura: borra el bloque de arriba y usa este ---
+# [theme]
+# base = "dark"
+# primaryColor = "#4DA3FF"
+# backgroundColor = "#0F1722"
+# secondaryBackgroundColor = "#1A2433"
+# textColor = "#F2F5F9"
+# font = "sans serif"
