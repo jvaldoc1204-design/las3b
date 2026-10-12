@@ -33,7 +33,7 @@ except ImportError:  # sin estas librerías la app funciona en modo local (JSON)
 #  INVENTARIO DE BODEGA - DISTRIBUIDORA LAS 3B
 # =====================================================
 
-VERSION = "beta 1.3"
+VERSION = "beta 1.4"
 ARCHIVO_DATOS = "inventario_las3b.json"
 CATEGORIAS = ["Aseo", "Higiene", "Abarrotes", "Lácteos", "Bebestibles", "Otros"]
 DIAS_ALERTA = 30      # "Por vencer" si faltan 30 días o menos
@@ -198,15 +198,32 @@ def avisar(tipo, texto):
 # -----------------------------------------------------
 #  FUNCIONES DE APOYO
 # -----------------------------------------------------
+SIN_FECHA = ""                 # un lote sin vencimiento guarda texto vacío
+FECHA_LEJANA = "9999-12-31"    # solo para ordenar: los lotes sin fecha van al final
+SENTINELA = date(9999, 12, 31)
+
+
 def a_fecha(texto):
-    return datetime.strptime(texto, "%Y-%m-%d").date()
+    """'YYYY-MM-DD' -> date. Devuelve None si el lote no tiene vencimiento."""
+    texto = str(texto or "").strip()
+    if not texto:
+        return None
+    return datetime.strptime(texto[:10], "%Y-%m-%d").date()
+
+
+def clave_venc(lote):
+    """Para ordenar lotes: primero los que vencen antes, al final los sin fecha."""
+    return str(lote.get("vencimiento") or "").strip() or FECHA_LEJANA
 
 
 def dias_restantes(lote):
-    return (a_fecha(lote["vencimiento"]) - date.today()).days
+    f = a_fecha(lote.get("vencimiento"))
+    return None if f is None else (f - date.today()).days
 
 
 def estado(dias):
+    if dias is None or pd.isna(dias):
+        return "⚪ Sin vencimiento"
     if dias < 0:
         return "🔴 Vencido"
     if dias <= DIAS_URGENTE:
@@ -214,6 +231,12 @@ def estado(dias):
     if dias <= DIAS_ALERTA:
         return "🟡 Por vencer"
     return "🟢 OK"
+
+
+def txt_venc(iso):
+    """'vence el 15/03/2027' o 'sin vencimiento'."""
+    f = a_fecha(iso)
+    return "sin vencimiento" if f is None else f"que vence el {f.strftime('%d/%m/%Y')}"
 
 
 def tabla_lotes(lotes):
@@ -229,8 +252,12 @@ def tabla_lotes(lotes):
             "Estado": estado(d),
             "Proveedor": l.get("proveedor", ""),
             "Ingreso": l.get("ingreso", ""),
+            "_orden": a_fecha(l["vencimiento"]) or SENTINELA,
         })
-    return pd.DataFrame(filas)
+    df = pd.DataFrame(filas)
+    if not df.empty:
+        df["Días restantes"] = pd.array(df["Días restantes"].tolist(), dtype="Int64")
+    return df
 
 
 def nombres_productos():
@@ -246,7 +273,7 @@ def descontar_fifo(nombre, cantidad, lotes=None):
         lotes = st.session_state.lotes
     lotes_prod = sorted(
         [l for l in lotes if l["nombre"] == nombre],
-        key=lambda l: l["vencimiento"],
+        key=clave_venc,
     )
     faltan = int(cantidad)
     detalle = []
@@ -256,7 +283,7 @@ def descontar_fifo(nombre, cantidad, lotes=None):
         sacar = min(l["cajas"], faltan)
         l["cajas"] -= sacar
         faltan -= sacar
-        detalle.append(f"{sacar} del lote que vence el {a_fecha(l['vencimiento']).strftime('%d/%m/%Y')}")
+        detalle.append(f"{sacar} del lote {txt_venc(l['vencimiento'])}")
     lotes[:] = [l for l in lotes if l["cajas"] > 0]
     return detalle
 
@@ -451,7 +478,8 @@ def entero_positivo(valor):
 
 
 def fmt_fecha(iso):
-    return a_fecha(iso).strftime("%d/%m/%Y")
+    f = a_fecha(iso)
+    return "sin vencimiento" if f is None else f.strftime("%d/%m/%Y")
 
 
 def unir_lotes_iguales(lotes, nombre):
@@ -465,6 +493,87 @@ def unir_lotes_iguales(lotes, nombre):
             lotes.remove(l)
         else:
             vistos[l["vencimiento"]] = l
+
+
+MSG_FALTA_FECHA = "falta la fecha de vencimiento. Dila, o toca «Ingresar sin fecha» si este producto no vence."
+
+
+def _numeros(nombre):
+    return set(re.findall(r"\d+", normalizar(nombre)))
+
+
+def _parecidos(a, b):
+    """True si dos nombres de producto probablemente son el mismo producto."""
+    na, nb = normalizar(a), normalizar(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    ca, cb = _numeros(a), _numeros(b)
+    if ca and cb and ca != cb:      # 'Coca-Cola 3L' y 'Coca-Cola 1.5L' NO son iguales
+        return False
+    corto, largo = (na, nb) if len(na) <= len(nb) else (nb, na)
+    if len(corto) >= 4 and (largo.startswith(corto + " ") or largo.endswith(" " + corto)):
+        return True
+    return difflib.SequenceMatcher(None, na, nb).ratio() >= 0.88
+
+
+def grupos_duplicados(lotes, incluir_lotes_multiples=False):
+    """Agrupa productos que parecen repetidos.
+
+    Devuelve una lista de grupos; cada grupo es una lista de nombres. Con
+    incluir_lotes_multiples también aparecen productos de un solo nombre con varios lotes.
+    """
+    nombres = sorted({l["nombre"] for l in lotes}, key=str.lower)
+    padre = {n: n for n in nombres}
+
+    def raiz(x):
+        while padre[x] != x:
+            padre[x] = padre[padre[x]]
+            x = padre[x]
+        return x
+
+    for i, a in enumerate(nombres):
+        for b in nombres[i + 1:]:
+            if _parecidos(a, b):
+                padre[raiz(a)] = raiz(b)
+    grupos = {}
+    for n in nombres:
+        grupos.setdefault(raiz(n), []).append(n)
+    salida = []
+    for g in grupos.values():
+        if len(g) > 1:
+            salida.append(sorted(g, key=str.lower))
+        elif incluir_lotes_multiples and sum(1 for l in lotes if l["nombre"] == g[0]) > 1:
+            salida.append(g)
+    return sorted(salida, key=lambda g: g[0].lower())
+
+
+def unir_grupo(lotes, nombres, canonico):
+    """Junta todos los lotes de 'nombres' en UN lote con el nombre 'canonico'.
+
+    Suma las cajas y deja la fecha de vencimiento MÁS TEMPRANA (los lotes sin fecha no cuentan;
+    si ninguno tiene fecha queda sin fecha). Modifica 'lotes' en el lugar. Devuelve el lote resultante.
+    """
+    miembros = [l for l in lotes if l["nombre"] in nombres]
+    if not miembros:
+        return None
+    con_fecha = sorted([l for l in miembros if l["vencimiento"]], key=clave_venc)
+    base = (con_fecha or miembros)[0]
+    resultado = {
+        "id": base["id"],
+        "nombre": canonico,
+        "categoria": next((l["categoria"] for l in miembros if l["nombre"] == canonico), base["categoria"]),
+        "cajas": sum(int(l["cajas"]) for l in miembros),
+        "vencimiento": base["vencimiento"] if con_fecha else SIN_FECHA,
+        "proveedor": next((l.get("proveedor", "") for l in [base] + miembros if l.get("proveedor")), ""),
+        "ingreso": min([l["ingreso"] for l in miembros if l.get("ingreso")] or [""]),
+    }
+    ids = {l["id"] for l in miembros}
+    pos = min(i for i, l in enumerate(lotes) if l["id"] in ids)
+    lotes[:] = [l for l in lotes if l["id"] not in ids]
+    lotes.insert(min(pos, len(lotes)), resultado)
+    return resultado
 
 
 def aplicar_accion(lotes, accion, hoy):
@@ -490,7 +599,11 @@ def aplicar_accion(lotes, accion, hoy):
             return False, f"{nombre}: faltan las cajas.", None
         venc = parsear_fecha(accion.get("vencimiento"))
         if venc is None:
-            return False, f"{nombre}: falta la fecha de vencimiento (escríbela en la orden).", None
+            sin_fecha_ok = bool(accion.get("sin_vencimiento")) or (
+                existe and all(not l["vencimiento"] for l in lotes if l["nombre"] == nombre))
+            if not sin_fecha_ok:
+                return False, (f"{nombre}: {MSG_FALTA_FECHA}"), None
+            venc = SIN_FECHA
         if existe:
             cat = next(l["categoria"] for l in lotes if l["nombre"] == nombre)
         else:
@@ -509,8 +622,9 @@ def aplicar_accion(lotes, accion, hoy):
                 "ingreso": hoy.isoformat(),
             })
         marca = "" if existe else f" (producto nuevo, {cat})"
-        aviso = "⚠️ Esa fecha ya pasó." if venc < hoy.isoformat() else None
-        return True, f"Ingresar {cajas} cajas de {nombre}{marca}, vence {fmt_fecha(venc)}", aviso
+        aviso = "⚠️ Esa fecha ya pasó." if venc and venc < hoy.isoformat() else None
+        cola = "sin vencimiento" if not venc else f"vence {fmt_fecha(venc)}"
+        return True, f"Ingresar {cajas} cajas de {nombre}{marca}, {cola}", aviso
 
     if tipo == "retirar":
         cajas = entero_positivo(accion.get("cajas"))
@@ -528,9 +642,11 @@ def aplicar_accion(lotes, accion, hoy):
         if not existe:
             return no_encontrado()
         nuevo = parsear_fecha(accion.get("vencimiento"))
+        if nuevo is None and accion.get("sin_vencimiento"):
+            nuevo = SIN_FECHA
         if nuevo is None:
             return False, f"{nombre}: falta la nueva fecha de vencimiento.", None
-        lotes_p = sorted([l for l in lotes if l["nombre"] == nombre], key=lambda l: l["vencimiento"])
+        lotes_p = sorted([l for l in lotes if l["nombre"] == nombre], key=clave_venc)
         actual = parsear_fecha(accion.get("vencimiento_actual"))
         if actual:
             objetivo = next((l for l in lotes_p if l["vencimiento"] == actual), None)
@@ -550,7 +666,7 @@ def aplicar_accion(lotes, accion, hoy):
             lotes.remove(objetivo)
         else:
             objetivo["vencimiento"] = nuevo
-        aviso = "⚠️ Esa fecha ya pasó." if nuevo < hoy.isoformat() else None
+        aviso = "⚠️ Esa fecha ya pasó." if nuevo and nuevo < hoy.isoformat() else None
         return True, f"Cambiar vencimiento de {nombre}: {fmt_fecha(anterior)} → {fmt_fecha(nuevo)}", aviso
 
     if tipo == "renombrar":
@@ -593,9 +709,9 @@ def resumen_inventario(lotes):
         p = por.setdefault(l["nombre"], {"producto": l["nombre"], "categoria": l["categoria"],
                                          "cajas_total": 0, "lotes": []})
         p["cajas_total"] += l["cajas"]
-        p["lotes"].append({"vence": l["vencimiento"], "cajas": l["cajas"]})
+        p["lotes"].append({"vence": l["vencimiento"] or "sin vencimiento", "cajas": l["cajas"]})
     for p in por.values():
-        p["lotes"].sort(key=lambda x: x["vence"])
+        p["lotes"].sort(key=lambda x: x["vence"] if x["vence"] != "sin vencimiento" else FECHA_LEJANA)
     return sorted(por.values(), key=lambda p: p["producto"].lower())
 
 
@@ -769,7 +885,7 @@ def interpretar_orden(texto, lotes):
         "Conviertes órdenes escritas por el personal en acciones sobre el inventario. "
         "Responde SOLO con un objeto JSON, sin texto adicional, con esta forma exacta: "
         '{"acciones": [{"tipo": "", "producto": "", "cajas": 0, "vencimiento": null, '
-        '"vencimiento_actual": null, "categoria": "", "proveedor": "", "nuevo_nombre": ""}], '
+        '"vencimiento_actual": null, "sin_vencimiento": false, "categoria": "", "proveedor": "", "nuevo_nombre": ""}], '
         '"respuesta": ""}\n\n'
         "Tipos de acción:\n"
         '- "ingresar": llegó mercadería (llegaron, entraron, ingresa, agrega, recibí). '
@@ -777,7 +893,8 @@ def interpretar_orden(texto, lotes):
         '- "retirar": se saca mercadería de bodega (saca, bajé, descuenta, salieron, despaché). '
         "Campos: producto, cajas.\n"
         '- "cambiar_vencimiento": corregir la fecha de un lote que ya existe. Campos: producto, '
-        "vencimiento (la fecha NUEVA) y vencimiento_actual (la fecha vieja, solo si la orden la dice; si no, null).\n"
+        "vencimiento (la fecha NUEVA) y vencimiento_actual (la fecha vieja, solo si la orden la dice; si no, null). "
+        'Para quitarle la fecha a un lote ("ya no vence") usa sin_vencimiento: true y vencimiento null.\n'
         '- "renombrar": cambiar el nombre de un producto. Campos: producto (nombre actual), nuevo_nombre.\n\n'
         "Reglas:\n"
         "1. Si la orden se refiere a algo que ya existe, usa EXACTAMENTE el nombre del inventario, "
@@ -787,7 +904,9 @@ def interpretar_orden(texto, lotes):
         f"3. Fechas en formato YYYY-MM-DD. Hoy es {hoy.isoformat()}. En Chile las fechas se escriben día/mes/año. "
         "Si solo dan mes y año (ej. 'marzo 2027' o '03/2027') usa el último día de ese mes. "
         "Si dicen 'en 6 meses' calcúlalo desde hoy.\n"
-        '4. NUNCA inventes una fecha de vencimiento: si en un "ingresar" no la dicen, pon null.\n'
+        '4. NUNCA inventes una fecha de vencimiento: si en un "ingresar" no la dicen, pon null. '
+        'Pon "sin_vencimiento": true SOLO si dicen que no vence / sin fecha, o si el producto claramente no '
+        'caduca (papel higiénico, toallas de papel, bolsas, escobas, pañales, esponjas). Ante la duda, false.\n'
         "5. categoria debe ser una de: " + ", ".join(CATEGORIAS) + ". Elige la más lógica para productos nuevos.\n"
         "6. Si la orden es una pregunta sobre el inventario (cuántas cajas hay, qué vence pronto, etc.), "
         'deja "acciones" vacío y responde en "respuesta" usando SOLO los datos del inventario entregado. '
@@ -840,15 +959,15 @@ if "aviso" in st.session_state:
     getattr(st, tipo)(texto)
 
 lotes = st.session_state.lotes
-vencidos = sum(1 for l in lotes if dias_restantes(l) < 0)
-por_vencer = sum(1 for l in lotes if 0 <= dias_restantes(l) <= DIAS_ALERTA)
+vencidos = sum(1 for l in lotes if (dias_restantes(l) is not None and dias_restantes(l) < 0))
+por_vencer = sum(1 for l in lotes if (dias_restantes(l) is not None and 0 <= dias_restantes(l) <= DIAS_ALERTA))
 st.markdown(
     f"**{sum(l['cajas'] for l in lotes)} cajas** · {len(nombres_productos())} productos · "
     f"🟡 {por_vencer} por vencer · 🔴 {vencidos} vencidos"
 )
 
 (tab_asistente, tab_inventario, tab_factura, tab_venc,
- tab_retirar, tab_ingresar, tab_editar) = st.tabs([
+ tab_retirar, tab_ingresar, tab_editar, tab_dup) = st.tabs([
     "🤖 Asistente",
     "📦 Inventario",
     "🧾 Factura",
@@ -856,6 +975,7 @@ st.markdown(
     "📤 Retirar",
     "➕ Ingresar",
     "✏️ Editar",
+    "🧹 Duplicados",
 ])
 
 
@@ -876,10 +996,12 @@ with tab_inventario:
         else:
             simple = (
                 df.groupby("Producto", as_index=False)
-                .agg(Cajas=("Cajas", "sum"), Vence=("Vencimiento", "min"))
+                .agg(Cajas=("Cajas", "sum"), Vence=("_orden", "min"))
                 .sort_values("Producto")
             )
+            simple["Vence"] = simple["Vence"].map(lambda d: None if d == SENTINELA else d)
             st.dataframe(simple, hide_index=True)
+            st.caption("Vence en blanco = producto sin fecha de vencimiento.")
 
         if st.toggle("➕ Ver más detalle", key="inv_detalle"):
             st.divider()
@@ -895,14 +1017,16 @@ with tab_inventario:
                     df_d.groupby(["Producto", "Categoría"], as_index=False)
                     .agg(**{"Cajas": ("Cajas", "sum"),
                             "Lotes": ("Cajas", "count"),
-                            "Próx. vence": ("Vencimiento", "min")})
+                            "Próx. vence": ("_orden", "min")})
                     .sort_values(["Categoría", "Producto"])
                 )
+                detalle["Próx. vence"] = detalle["Próx. vence"].map(
+                    lambda d: None if d == SENTINELA else d)
                 st.dataframe(detalle, hide_index=True)
                 with st.expander("Ver lote por lote"):
                     st.dataframe(
-                        df_d.sort_values(["Producto", "Vencimiento"])[
-                            ["Producto", "Cajas", "Vencimiento", "Días restantes", "Proveedor"]],
+                        df_d.sort_values(["Producto", "_orden"])[
+                            ["Producto", "Cajas", "Vencimiento", "Días restantes", "Estado", "Proveedor"]],
                         hide_index=True,
                     )
 
@@ -985,6 +1109,21 @@ with tab_factura:
                 },
             )
 
+            sin_f_vista = [
+                str(f["Producto"]) for _, f in editado.iterrows()
+                if bool(f["Incluir"]) and pd.isna(f["Vencimiento"]) and str(f["Producto"] or "").strip()
+            ]
+            omitir_fecha = False
+            if sin_f_vista:
+                st.warning(
+                    f"📅 Te falta la fecha de vencimiento en {len(sin_f_vista)} producto(s): "
+                    + ", ".join(sin_f_vista[:6]) + ("…" if len(sin_f_vista) > 6 else "")
+                )
+                omitir_fecha = st.checkbox(
+                    "Ingresar sin fecha (son productos que no vencen, como papel higiénico)",
+                    key="fac_omitir_fecha",
+                )
+
             c_ok, c_cancel = st.columns(2)
             confirmar_f = c_ok.button("✅ Ingresar", type="primary")
             cancelar_f = c_cancel.button("Descartar")
@@ -994,7 +1133,7 @@ with tab_factura:
                 st.rerun()
 
             if confirmar_f:
-                errores, nuevos = [], []
+                errores, nuevos, sin_fecha_f = [], [], []
                 for i, fila in editado.iterrows():
                     if not bool(fila["Incluir"]):
                         continue
@@ -1006,15 +1145,21 @@ with tab_factura:
                         errores.append(f"Fila {i + 1} ({nombre_f}): faltan las cajas.")
                         continue
                     if pd.isna(fila["Vencimiento"]):
-                        errores.append(f"Fila {i + 1} ({nombre_f}): falta la fecha de vencimiento.")
-                        continue
+                        sin_fecha_f.append(nombre_f)
+                        venc_f = SIN_FECHA
+                    else:
+                        venc_f = pd.to_datetime(fila["Vencimiento"]).date().isoformat()
                     nuevos.append({
                         "nombre": nombre_f,
                         "categoria": fila["Categoría"] if fila["Categoría"] in CATEGORIAS else "Otros",
                         "cajas": int(fila["Cajas"]),
-                        "vencimiento": pd.to_datetime(fila["Vencimiento"]).date().isoformat(),
+                        "vencimiento": venc_f,
                     })
 
+                if sin_fecha_f and not omitir_fecha:
+                    errores.append(
+                        "Sin fecha de vencimiento: " + ", ".join(sin_fecha_f)
+                        + ". Complétala en la tabla o marca «Ingresar sin fecha» arriba.")
                 if errores:
                     st.error("Sea serio, faltan datos 😐\n\n" + "\n".join(f"- {e}" for e in errores))
                 elif not nuevos:
@@ -1062,7 +1207,7 @@ with tab_retirar:
         with st.expander("Ver lotes"):
             lotes_prod = [l for l in st.session_state.lotes if l["nombre"] == producto]
             st.dataframe(
-                tabla_lotes(lotes_prod).sort_values("Vencimiento")[
+                tabla_lotes(lotes_prod).sort_values("_orden")[
                     ["Cajas", "Vencimiento", "Días restantes", "Estado"]],
                 hide_index=True,
             )
@@ -1174,6 +1319,13 @@ with tab_asistente:
                     if item["aviso"]:
                         st.caption(item["aviso"])
                 validas_a = [i for i in plan_a if i["ok"]]
+                faltan_fecha = [i for i in plan_a
+                                if not i["ok"] and i["texto"].endswith(MSG_FALTA_FECHA)]
+                if faltan_fecha:
+                    if st.button(f"📅 Ingresar sin fecha ({len(faltan_fecha)})", key="asist_sinfecha"):
+                        for i in faltan_fecha:
+                            i["accion"]["sin_vencimiento"] = True
+                        st.rerun()
                 if not validas_a:
                     st.warning("Ninguna acción se puede aplicar. Corrige la orden y vuelve a interpretarla.")
             elif not respuesta_a:
@@ -1211,7 +1363,9 @@ with tab_venc:
         st.info("Aún no hay lotes registrados.")
     else:
         ver_todos = st.toggle("➕ Ver todos los lotes", key="venc_todos")
-        df_v = tabla_lotes(lotes).sort_values("Vencimiento")
+        df_v = tabla_lotes(lotes).sort_values("_orden")
+        sin_f = int(df_v["Vencimiento"].isna().sum())
+        df_v = df_v[df_v["Vencimiento"].notna()]
         if not ver_todos:
             df_v = df_v[df_v["Días restantes"] <= DIAS_ALERTA]
 
@@ -1225,6 +1379,8 @@ with tab_venc:
         st.caption(
             f"🟠 {DIAS_URGENTE} días o menos · 🟡 {DIAS_ALERTA} días o menos · 🔴 ya vencido"
         )
+        if sin_f:
+            st.caption(f"⚪ {sin_f} lote(s) sin fecha de vencimiento no se vigilan aquí.")
 
 
 # -----------------------------------------------------
@@ -1234,48 +1390,71 @@ with tab_ingresar:
     st.subheader("Ingreso manual")
     st.caption("Para cuando no hay factura a mano. Ejemplo: llega McKay.")
 
-    with st.form("form_ingreso", clear_on_submit=True):
-        nombre = st.text_input("Nombre del producto:")
-        categoria = st.selectbox("Categoría:", CATEGORIAS)
-        cajas = st.number_input("Cajas que llegaron:", min_value=1, step=1)
-        try:
-            vencimiento = st.date_input("Fecha de vencimiento:", value=None, format="DD/MM/YYYY")
-        except Exception:  # versiones viejas de Streamlit no permiten dejarla vacía
-            vencimiento = st.date_input("Fecha de vencimiento:", value=date.today(), format="DD/MM/YYYY")
-        proveedor = st.text_input("Proveedor (opcional):", placeholder="Ej: McKay")
+    def ingresar_lote(nombre_l, categoria_l, cajas_l, venc_txt_l, proveedor_l):
+        """Suma a un lote igual (mismo nombre y fecha) o crea uno nuevo. Devuelve True si se guardó."""
+        existente = next(
+            (l for l in st.session_state.lotes
+             if l["nombre"].lower() == nombre_l.lower() and l["vencimiento"] == venc_txt_l),
+            None,
+        )
+        if existente:
+            existente["cajas"] += int(cajas_l)
+        else:
+            st.session_state.lotes.append({
+                "id": uuid.uuid4().hex[:8],
+                "nombre": nombre_l,
+                "categoria": categoria_l,
+                "cajas": int(cajas_l),
+                "vencimiento": venc_txt_l,
+                "proveedor": proveedor_l.strip(),
+                "ingreso": date.today().isoformat(),
+            })
+        return guardar()
 
-        enviar = st.form_submit_button("Agregar a bodega")
+    pend = st.session_state.get("ing_pendiente")
+    if pend:
+        st.warning(
+            f"📅 Te faltó la fecha de vencimiento de **{pend['nombre']}** ({pend['cajas']} cajas). "
+            "¿La quieres agregar o la omites?"
+        )
+        c_si, c_no = st.columns(2)
+        if c_si.button("📅 Agregar fecha", key="ing_agregar_fecha"):
+            st.session_state.pop("ing_pendiente", None)
+            st.rerun()
+        if c_no.button("Omitir (no vence)", type="primary", key="ing_omitir_fecha"):
+            if ingresar_lote(pend["nombre"], pend["categoria"], pend["cajas"], SIN_FECHA, pend["proveedor"]):
+                st.session_state.pop("ing_pendiente", None)
+                avisar("success", f"¡Listo! {pend['cajas']} cajas de '{pend['nombre']}' ingresadas sin vencimiento. Oliver mi peyito 🐶")
+                st.rerun()
+    else:
+        with st.form("form_ingreso", clear_on_submit=True):
+            nombre = st.text_input("Nombre del producto:")
+            categoria = st.selectbox("Categoría:", CATEGORIAS)
+            cajas = st.number_input("Cajas que llegaron:", min_value=1, step=1)
+            try:
+                vencimiento = st.date_input("Fecha de vencimiento:", value=None, format="DD/MM/YYYY")
+            except Exception:  # versiones viejas de Streamlit no permiten dejarla vacía
+                vencimiento = st.date_input("Fecha de vencimiento:", value=date.today(), format="DD/MM/YYYY")
+            sin_venc = st.checkbox("No vence (papel higiénico, bolsas, etc.)")
+            proveedor = st.text_input("Proveedor (opcional):", placeholder="Ej: McKay")
 
-        if enviar:
-            if not nombre.strip():
-                st.error("Sea serio: falta el nombre del producto 😐")
-            elif vencimiento is None:
-                st.error("Falta la fecha de vencimiento 📅")
-            else:
+            enviar = st.form_submit_button("Agregar a bodega")
+
+            if enviar:
                 nombre_limpio = nombre.strip()
-                venc_txt = vencimiento.isoformat()
-
-                # Si ya existe el mismo producto con la misma fecha, se suman las cajas
-                existente = next(
-                    (l for l in st.session_state.lotes
-                     if l["nombre"].lower() == nombre_limpio.lower()
-                     and l["vencimiento"] == venc_txt),
-                    None,
-                )
-                if existente:
-                    existente["cajas"] += int(cajas)
+                if not nombre_limpio:
+                    st.error("Sea serio: falta el nombre del producto 😐")
+                elif vencimiento is None and not sin_venc:
+                    # Se olvidó la fecha: se pregunta si se agrega u omite
+                    st.session_state.ing_pendiente = {
+                        "nombre": nombre_limpio, "categoria": categoria,
+                        "cajas": int(cajas), "proveedor": proveedor,
+                    }
+                    st.rerun()
                 else:
-                    st.session_state.lotes.append({
-                        "id": uuid.uuid4().hex[:8],
-                        "nombre": nombre_limpio,
-                        "categoria": categoria,
-                        "cajas": int(cajas),
-                        "vencimiento": venc_txt,
-                        "proveedor": proveedor.strip(),
-                        "ingreso": date.today().isoformat(),
-                    })
-                if guardar():
-                    st.success(f"¡Listo! {int(cajas)} cajas de '{nombre_limpio}' ingresadas. Oliver mi peyito 🐶")
+                    venc_txt = SIN_FECHA if sin_venc else vencimiento.isoformat()
+                    if ingresar_lote(nombre_limpio, categoria, cajas, venc_txt, proveedor):
+                        st.success(f"¡Listo! {int(cajas)} cajas de '{nombre_limpio}' ingresadas. Oliver mi peyito 🐶")
 
 
 # -----------------------------------------------------
@@ -1287,9 +1466,9 @@ with tab_editar:
     if not lotes:
         st.warning("No hay lotes para editar.")
     else:
-        ordenados = sorted(lotes, key=lambda l: (l["nombre"].lower(), l["vencimiento"]))
+        ordenados = sorted(lotes, key=lambda l: (l["nombre"].lower(), clave_venc(l)))
         etiquetas = {
-            l["id"]: f"{l['nombre']} · vence {a_fecha(l['vencimiento']).strftime('%d/%m/%Y')} · {l['cajas']} cajas"
+            l["id"]: f"{l['nombre']} · {'vence ' + fmt_fecha(l['vencimiento']) if l['vencimiento'] else 'sin vencimiento'} · {l['cajas']} cajas"
             for l in ordenados
         }
         id_sel = st.selectbox(
@@ -1306,7 +1485,11 @@ with tab_editar:
             )
             nuevas_cajas = st.number_input("Cajas:", min_value=1, value=int(lote["cajas"]), step=1)
             nuevo_venc = st.date_input(
-                "Vencimiento:", value=a_fecha(lote["vencimiento"]), format="DD/MM/YYYY",
+                "Vencimiento:", value=a_fecha(lote["vencimiento"]) or date.today(), format="DD/MM/YYYY",
+            )
+            quitar_venc = st.checkbox(
+                "Sin vencimiento (ignora la fecha de arriba)",
+                value=not lote["vencimiento"],
             )
             guardar_cambios = st.form_submit_button("Guardar cambios")
 
@@ -1317,7 +1500,7 @@ with tab_editar:
                     lote["nombre"] = nuevo_nombre.strip()
                     lote["categoria"] = nueva_cat
                     lote["cajas"] = int(nuevas_cajas)
-                    lote["vencimiento"] = nuevo_venc.isoformat()
+                    lote["vencimiento"] = SIN_FECHA if quitar_venc else nuevo_venc.isoformat()
                     if guardar():
                         avisar("success", "Lote actualizado ✅")
                         st.rerun()
@@ -1329,6 +1512,54 @@ with tab_editar:
             if guardar():
                 avisar("success", "Lote eliminado.")
                 st.rerun()
+
+
+# -----------------------------------------------------
+#  7. DUPLICADOS (unir productos repetidos)
+# -----------------------------------------------------
+with tab_dup:
+    st.subheader("Unir duplicados")
+    st.caption(
+        "Busca productos que parecen el mismo escrito distinto (ej. «Muibon» y «Muibon 50g»). "
+        "Al unirlos se suman las cajas y queda la fecha de vencimiento MÁS TEMPRANA."
+    )
+    if not lotes:
+        st.info("Aún no hay lotes registrados.")
+    else:
+        con_multi = st.toggle(
+            "Incluir productos con varios lotes de distinta fecha", key="dup_multi",
+            help="Junta todos los lotes de un producto en uno solo con la fecha más próxima.",
+        )
+        grupos = grupos_duplicados(st.session_state.lotes, con_multi)
+        if not grupos:
+            st.success("No encontré duplicados 🎉")
+        else:
+            elegidos = []
+            for gi, g in enumerate(grupos):
+                miembros = [l for l in st.session_state.lotes if l["nombre"] in g]
+                con_fecha = sorted([l for l in miembros if l["vencimiento"]], key=clave_venc)
+                total_cajas = sum(int(l["cajas"]) for l in miembros)
+                with st.container(border=True):
+                    canon = st.selectbox(
+                        "Nombre final:", g, index=min(range(len(g)), key=lambda i: len(g[i])),
+                        key=f"dup_nombre_{gi}_{'|'.join(g)}",
+                    )
+                    st.dataframe(
+                        tabla_lotes(miembros).sort_values("_orden")[
+                            ["Producto", "Cajas", "Vencimiento", "Estado"]],
+                        hide_index=True,
+                    )
+                    cola = f"vence {fmt_fecha(con_fecha[0]['vencimiento'])}" if con_fecha else "sin vencimiento"
+                    st.markdown(f"➡️ **{canon}** · {total_cajas} cajas · {cola}")
+                    if st.checkbox("Unir este grupo", key=f"dup_ok_{gi}_{'|'.join(g)}"):
+                        elegidos.append((g, canon))
+            if st.button(f"🧹 Unir seleccionados ({len(elegidos)})", type="primary",
+                         disabled=not elegidos, key="dup_unir"):
+                for g, canon in elegidos:
+                    unir_grupo(st.session_state.lotes, g, canon)
+                if guardar():
+                    avisar("success", f"Listo: {len(elegidos)} grupo(s) unido(s) 🧹")
+                    st.rerun()
 
 
 # -----------------------------------------------------
