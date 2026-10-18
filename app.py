@@ -33,8 +33,9 @@ except ImportError:  # sin estas librerías la app funciona en modo local (JSON)
 #  INVENTARIO DE BODEGA - DISTRIBUIDORA LAS 3B
 # =====================================================
 
-VERSION = "beta 1.5"
+VERSION = "beta 1.6"
 ARCHIVO_DATOS = "inventario_las3b.json"
+ARCHIVO_FALTANTES = "faltantes_las3b.json"
 CATEGORIAS = ["Aseo", "Higiene", "Abarrotes", "Lácteos", "Bebestibles", "Otros"]
 DIAS_ALERTA = 30      # "Por vencer" si faltan 30 días o menos
 DIAS_URGENTE = 7      # "Urgente" si faltan 7 días o menos
@@ -147,6 +148,32 @@ def tarjetas_html(items):
     return "".join(partes)
 
 
+def boton_voz(texto):
+    """Botón '🔊 Escuchar': el navegador lee el texto en voz alta (gratis, sin IA)."""
+    texto = str(texto or "").strip()
+    if not texto:
+        return
+    carga = json.dumps(texto).replace("</", "<\\/")
+    st.components.v1.html(
+        """<button id="b" style="width:100%;height:44px;border:0;border-radius:12px;background:#E23744;
+        color:#fff;font-size:16px;font-weight:600;cursor:pointer">🔊 Escuchar respuesta</button>
+        <script>
+        const t = """ + carga + """;
+        document.getElementById('b').onclick = () => {
+          try {
+            speechSynthesis.cancel();
+            const u = new SpeechSynthesisUtterance(t);
+            u.lang = 'es-CL';
+            const v = speechSynthesis.getVoices().find(x => x.lang.toLowerCase().startsWith('es'));
+            if (v) u.voice = v;
+            speechSynthesis.speak(u);
+          } catch (e) {}
+        };
+        </script>""",
+        height=56,
+    )
+
+
 def kpis_html(cajas, productos, por_vencer, vencidos):
     def k(valor, texto, clase=""):
         return f'<div class="l3-kpi {clase}"><b>{valor}</b><span>{texto}</span></div>'
@@ -230,6 +257,7 @@ pantalla_acceso()
 #  ALMACENAMIENTO
 # -----------------------------------------------------
 CAMPOS = ["id", "nombre", "categoria", "cajas", "vencimiento", "proveedor", "ingreso"]
+CAMPOS_F = ["nombre", "categoria", "desde", "nota", "origen"]
 
 
 def usar_sheets():
@@ -241,7 +269,7 @@ def usar_sheets():
 
 
 @st.cache_resource
-def obtener_hoja():
+def obtener_hoja(pestana="lotes"):
     permisos = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
@@ -252,9 +280,9 @@ def obtener_hoja():
     cliente = gspread.authorize(creds)
     libro = cliente.open_by_key(st.secrets["sheet_id"])
     try:
-        hoja = libro.worksheet("lotes")
+        hoja = libro.worksheet(pestana)
     except gspread.WorksheetNotFound:
-        hoja = libro.add_worksheet(title="lotes", rows=1000, cols=len(CAMPOS))
+        hoja = libro.add_worksheet(title=pestana, rows=1000, cols=10)
     return hoja
 
 
@@ -306,14 +334,72 @@ def guardar_lotes(lotes):
     return True
 
 
+def cargar_faltantes():
+    """Lista de productos que no quedan en bodega (pestaña 'faltantes')."""
+    if usar_sheets():
+        try:
+            valores = obtener_hoja("faltantes").get_all_values()
+        except Exception as e:
+            st.warning(f"No pude leer la lista de faltantes: {e}")
+            return st.session_state.get("faltantes", [])
+        if not valores:
+            return []
+        salida = []
+        for fila in valores[1:]:
+            fila = fila + [""] * (len(CAMPOS_F) - len(fila))
+            d = dict(zip(CAMPOS_F, fila))
+            if d["nombre"].strip():
+                salida.append(d)
+        return salida
+    if os.path.exists(ARCHIVO_FALTANTES):
+        try:
+            with open(ARCHIVO_FALTANTES, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return []
+    return []
+
+
+def guardar_faltantes(lista):
+    if usar_sheets():
+        filas = [CAMPOS_F] + [[f.get(c, "") for c in CAMPOS_F] for f in lista]
+        try:
+            hoja = obtener_hoja("faltantes")
+            hoja.clear()
+            hoja.update(values=filas, range_name="A1", value_input_option="RAW")
+        except Exception as e:
+            st.error(f"No pude guardar la lista de faltantes: {e}")
+            return False
+        return True
+    with open(ARCHIVO_FALTANTES, "w", encoding="utf-8") as f:
+        json.dump(lista, f, ensure_ascii=False, indent=4)
+    return True
+
+
 # En modo nube se recarga la planilla en cada interacción, así todos ven datos frescos.
 if usar_sheets() or "lotes" not in st.session_state:
     st.session_state.lotes = cargar_lotes()
+if usar_sheets() or "faltantes" not in st.session_state:
+    st.session_state.faltantes = cargar_faltantes()
+st.session_state.setdefault("faltantes_sucio", False)
 
 
 def guardar():
     """Devuelve True solo si los datos realmente se guardaron."""
-    return guardar_lotes(st.session_state.lotes)
+    if not guardar_lotes(st.session_state.lotes):
+        return False
+    limpiar_faltantes()          # los que ya tienen stock salen de la lista
+    guardar_faltantes_si_hace_falta()
+    return True
+
+
+def guardar_faltantes_si_hace_falta():
+    if st.session_state.get("faltantes_sucio"):
+        if guardar_faltantes(st.session_state.faltantes):
+            st.session_state.faltantes_sucio = False
+            return True
+        return False
+    return True
 
 
 def avisar(tipo, texto):
@@ -585,6 +671,93 @@ def sugerencias(nombre, existentes, max_n=4):
     return salida[:max_n]
 
 
+def tiene_stock(nombre):
+    n = normalizar(nombre)
+    return any(normalizar(l["nombre"]) == n for l in st.session_state.lotes)
+
+
+def n_cajas(n):
+    return f"{n} caja" if n == 1 else f"{n} cajas"
+
+
+def registrar_faltante(nombre, categoria="Otros", nota="", origen="auto"):
+    """Agrega a Faltantes (si no estaba). Devuelve True si se agregó."""
+    nombre = str(nombre or "").strip()
+    if not nombre:
+        return False
+    n = normalizar(nombre)
+    if any(normalizar(f["nombre"]) == n for f in st.session_state.faltantes):
+        return False
+    st.session_state.faltantes.append({
+        "nombre": nombre,
+        "categoria": categoria if categoria in CATEGORIAS else "Otros",
+        "desde": hoy_chile().isoformat(),
+        "nota": str(nota or "").strip(),
+        "origen": origen,
+    })
+    st.session_state.faltantes_sucio = True
+    return True
+
+
+def quitar_faltante(nombre):
+    n = normalizar(nombre)
+    antes = len(st.session_state.faltantes)
+    st.session_state.faltantes = [f for f in st.session_state.faltantes if normalizar(f["nombre"]) != n]
+    if len(st.session_state.faltantes) != antes:
+        st.session_state.faltantes_sucio = True
+
+
+def limpiar_faltantes():
+    """Saca de la lista los productos que volvieron a tener stock."""
+    antes = len(st.session_state.faltantes)
+    st.session_state.faltantes = [f for f in st.session_state.faltantes if not tiene_stock(f["nombre"])]
+    if len(st.session_state.faltantes) != antes:
+        st.session_state.faltantes_sucio = True
+
+
+def registrar_agotados(candidatos, origen="auto"):
+    """candidatos: {nombre: categoria}. Los que ya no tienen stock pasan a Faltantes.
+
+    Devuelve la lista de nombres que se agregaron.
+    """
+    agregados = []
+    for nombre, cat in candidatos.items():
+        if not tiene_stock(nombre) and registrar_faltante(nombre, cat, "", origen):
+            agregados.append(nombre)
+    return agregados
+
+
+def responder_consulta(lotes, accion, faltantes):
+    """Contesta '¿cuántas cajas quedan de X?' con los datos reales (sin IA)."""
+    nombre_in = str(accion.get("producto") or "").strip()
+    if not nombre_in:
+        return "¿De qué producto quieres saber?"
+    existentes = sorted({l["nombre"] for l in lotes}, key=str.lower)
+    nombre, existe = resolver_producto(nombre_in, existentes)
+    if existe:
+        mios = sorted([l for l in lotes if l["nombre"] == nombre], key=clave_venc)
+        total = sum(int(l["cajas"]) for l in mios)
+
+        def venc_txt(l):
+            if not l["vencimiento"]:
+                return "sin vencimiento"
+            return f"que {'vence' if int(l['cajas']) == 1 else 'vencen'} el {fmt_fecha(l['vencimiento'])}"
+
+        verbo = "Queda" if total == 1 else "Quedan"
+        if len(mios) == 1:
+            return f"{verbo} {n_cajas(total)} de {nombre}, {venc_txt(mios[0])}."
+        return f"{verbo} {n_cajas(total)} de {nombre}: " + "; ".join(
+            f"{n_cajas(int(l['cajas']))} {venc_txt(l)}" for l in mios) + "."
+    nn = normalizar(nombre_in)
+    en_f = next((f for f in faltantes
+                 if normalizar(f["nombre"]) == nn or (len(nn) >= 3 and nn in normalizar(f["nombre"]))), None)
+    if en_f:
+        return f"De {en_f['nombre']} no queda ninguna caja. Está en Faltantes desde el {fmt_fecha(en_f['desde'])}."
+    sug = sugerencias(nombre_in, existentes)
+    extra = f" ¿Quisiste decir: {', '.join(sug)}?" if sug else ""
+    return f"No encontré '{nombre_in}' en bodega.{extra}"
+
+
 def parsear_fecha(valor):
     """Devuelve 'YYYY-MM-DD' o None si no se entiende."""
     if not valor:
@@ -794,6 +967,19 @@ def aplicar_accion(lotes, accion, hoy):
             objetivo["vencimiento"] = nuevo
         aviso = "⚠️ Esa fecha ya pasó." if nuevo and nuevo < hoy.isoformat() else None
         return True, f"Cambiar vencimiento de {nombre}: {fmt_fecha(anterior)} → {fmt_fecha(nuevo)}", aviso
+
+    if tipo == "agotar":
+        if not existe:
+            return True, f"Anotar {nombre} en Faltantes (no había cajas en bodega)", None
+        total = sum(l["cajas"] for l in lotes if l["nombre"] == nombre)
+        lotes[:] = [l for l in lotes if l["nombre"] != nombre]
+        return True, f"Dejar {nombre} en 0 cajas (había {total}) y anotarlo en Faltantes", None
+
+    if tipo == "faltante":
+        if existe:
+            total = sum(l["cajas"] for l in lotes if l["nombre"] == nombre)
+            return False, f"{nombre}: todavía hay {n_cajas(total)} en bodega, no está faltando.", None
+        return True, f"Anotar {nombre} en Faltantes", None
 
     if tipo == "renombrar":
         if not existe:
@@ -1021,7 +1207,10 @@ def interpretar_orden(texto, lotes):
         '- "cambiar_vencimiento": corregir la fecha de un lote que ya existe. Campos: producto, '
         "vencimiento (la fecha NUEVA) y vencimiento_actual (la fecha vieja, solo si la orden la dice; si no, null). "
         'Para quitarle la fecha a un lote ("ya no vence") usa sin_vencimiento: true y vencimiento null.\n'
-        '- "renombrar": cambiar el nombre de un producto. Campos: producto (nombre actual), nuevo_nombre.\n\n'
+        '- "renombrar": cambiar el nombre de un producto. Campos: producto (nombre actual), nuevo_nombre.\n'
+        '- "consultar": preguntan cuántas cajas quedan de un producto. Campos: producto. No cambia nada.\n'
+        '- "agotar": se acabó un producto que está en bodega (no queda nada, quedan 0, no hay más). Campos: producto.\n'
+        '- "faltante": anotar en la lista de Faltantes un producto que falta o hay que pedir. Campos: producto, categoria.\n\n'
         "Reglas:\n"
         "1. Si la orden se refiere a algo que ya existe, usa EXACTAMENTE el nombre del inventario, "
         "aunque el usuario lo escriba abreviado, sin tildes o con otras mayúsculas. "
@@ -1034,7 +1223,8 @@ def interpretar_orden(texto, lotes):
         'Pon "sin_vencimiento": true SOLO si dicen que no vence / sin fecha, o si el producto claramente no '
         'caduca (papel higiénico, toallas de papel, bolsas, escobas, pañales, esponjas). Ante la duda, false.\n'
         "5. categoria debe ser una de: " + ", ".join(CATEGORIAS) + ". Elige la más lógica para productos nuevos.\n"
-        "6. Si la orden es una pregunta sobre el inventario (cuántas cajas hay, qué vence pronto, etc.), "
+        '6. Si preguntan por las cajas de UN producto usa "consultar" (una acción por producto). '
+        "Si la orden es otra pregunta sobre el inventario (qué vence pronto, qué hay de una categoría, etc.), "
         'deja "acciones" vacío y responde en "respuesta" usando SOLO los datos del inventario entregado. '
         "Si el dato no está, dilo.\n"
         '7. Si la orden es confusa o falta información importante (producto o cantidad), deja "acciones" vacío '
@@ -1092,10 +1282,11 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-(tab_asistente, tab_inventario, tab_factura, tab_venc,
+(tab_asistente, tab_inventario, tab_falt, tab_factura, tab_venc,
  tab_retirar, tab_ingresar, tab_editar, tab_dup) = st.tabs([
     "🤖 Asistente",
     "📦 Inventario",
+    f"🚨 Faltantes ({len(st.session_state.faltantes)})" if st.session_state.faltantes else "🚨 Faltantes",
     "🧾 Factura",
     "⏰ Vencimientos",
     "📤 Retirar",
@@ -1173,6 +1364,67 @@ with tab_inventario:
                 .reindex(CATEGORIAS, fill_value=0)
             )
             st.bar_chart(por_cat)
+
+
+# -----------------------------------------------------
+#  1b. FALTANTES
+# -----------------------------------------------------
+with tab_falt:
+    st.subheader("Productos que faltan")
+    st.caption(
+        "Se anotan solos cuando un producto llega a 0 cajas y salen solos cuando vuelve a entrar "
+        "mercadería. También puedes anotar uno a mano."
+    )
+    faltantes_v = st.session_state.faltantes
+    if not faltantes_v:
+        st.success("No falta nada 🎉")
+    else:
+        hoy_f = hoy_chile()
+        tarjetas_f = []
+        for f in sorted(faltantes_v, key=lambda x: x.get("desde") or ""):
+            try:
+                dias_f = (hoy_f - a_fecha(f["desde"])).days
+                desde_txt = f"Falta desde el {fmt_fecha(f['desde'])}" + (
+                    " (hoy)" if dias_f == 0 else f" (hace {dias_f} d)")
+            except Exception:
+                desde_txt = "Falta"
+            origen_txt = "anotado a mano" if f.get("origen") == "manual" else "se acabó"
+            nota_txt = f" · {f['nota']}" if f.get("nota") else ""
+            tarjetas_f.append({
+                "nombre": f["nombre"], "cajas": 0, "clase": "vencido",
+                "sub": f"{desde_txt} · {origen_txt}{nota_txt}",
+            })
+        st.markdown(tarjetas_html(tarjetas_f), unsafe_allow_html=True)
+
+        st.write("**Para avisarle a tu jefe** (toca el ícono de copiar):")
+        st.code("Faltan en bodega:\n" + "\n".join(f"- {f['nombre']}" for f in faltantes_v), language=None)
+
+        nombres_f = [f["nombre"] for f in faltantes_v]
+        quitar = st.selectbox("Quitar de la lista:", nombres_f, key="falt_quitar")
+        if st.button("✅ Ya llegó / quitar", key="falt_quitar_btn"):
+            quitar_faltante(quitar)
+            if guardar_faltantes_si_hace_falta():
+                avisar("success", f"'{quitar}' salió de Faltantes.")
+                st.rerun()
+
+    st.divider()
+    with st.form("form_faltante", clear_on_submit=True):
+        nom_f = st.text_input("Anotar un producto que falta:")
+        cat_f = st.selectbox("Categoría:", CATEGORIAS, key="falt_cat")
+        nota_f = st.text_input("Nota (opcional):", placeholder="Ej: pedir 10 cajas")
+        enviar_f = st.form_submit_button("🚨 Agregar a faltantes")
+        if enviar_f:
+            nom_f = nom_f.strip()
+            if not nom_f:
+                st.error("Escribe el nombre del producto 😐")
+            elif tiene_stock(nom_f):
+                st.warning(f"De '{nom_f}' todavía hay cajas en bodega, no está faltando.")
+            elif registrar_faltante(nom_f, cat_f, nota_f, "manual"):
+                if guardar_faltantes_si_hace_falta():
+                    avisar("success", f"'{nom_f}' anotado en Faltantes 🚨")
+                    st.rerun()
+            else:
+                st.info("Ese producto ya estaba en la lista.")
 
 
 # -----------------------------------------------------
@@ -1354,9 +1606,12 @@ with tab_retirar:
             if retirar > total:
                 st.error(f"Dígale que no queda: solo hay {total} cajas 🤷")
             else:
+                cat_prod = next(l["categoria"] for l in st.session_state.lotes if l["nombre"] == producto)
                 detalle = descontar_fifo(producto, retirar)
+                agotado = registrar_agotados({producto: cat_prod})
                 if guardar():
-                    avisar("success", f"Retiradas {int(retirar)} cajas de '{producto}': " + "; ".join(detalle) + ".")
+                    extra_f = " 🚨 Se acabó: quedó anotado en Faltantes." if agotado else ""
+                    avisar("success", f"Retiradas {int(retirar)} cajas de '{producto}': " + "; ".join(detalle) + "." + extra_f)
                     st.rerun()
 
 
@@ -1440,10 +1695,22 @@ with tab_asistente:
                 f"{'🎤 Escuché' if datos_a.get('voz') else 'Orden'}: «{datos_a['orden']}» "
                 f"· interpretada con {datos_a['quien']}"
             )
+            def _es_consulta(a):
+                return isinstance(a, dict) and str(a.get("tipo") or "").strip().lower() == "consultar"
+
+            consultas_a = [a for a in acciones_a if _es_consulta(a)]
+            acciones_a = [a for a in acciones_a if not _es_consulta(a)]
+            respuestas_c = [
+                responder_consulta(st.session_state.lotes, a, st.session_state.faltantes)
+                for a in consultas_a
+            ]
+            for texto_c in respuestas_c:
+                st.success(texto_c)
             if respuesta_a:
                 st.info(respuesta_a)
-                if not acciones_a:
+                if not acciones_a and not respuestas_c:
                     st.caption("Respuesta de la IA según el inventario. Si es importante, confírmala en 📦 Inventario.")
+            boton_voz(" ".join(respuestas_c + ([respuesta_a] if respuesta_a else [])))
 
             validas_a = []
             if acciones_a:
@@ -1464,7 +1731,7 @@ with tab_asistente:
                         st.rerun()
                 if not validas_a:
                     st.warning("Ninguna acción se puede aplicar. Corrige la orden y vuelve a interpretarla.")
-            elif not respuesta_a:
+            elif not respuesta_a and not respuestas_c:
                 st.warning("No entendí la orden. Prueba escribiéndola de otra forma.")
 
             b_ok, b_no = st.columns(2)
@@ -1480,14 +1747,32 @@ with tab_asistente:
                 st.rerun()
 
             if confirmar_a and validas_a:
+                # Antes de aplicar: qué productos podrían quedar en cero y cuáles anotar a mano
+                cat_por_nombre = {l["nombre"]: l["categoria"] for l in st.session_state.lotes}
+                candidatos_f, manuales_f = {}, []
+                for item in validas_a:
+                    acc = item["accion"]
+                    tipo_c = str(acc.get("tipo") or "").strip().lower()
+                    if tipo_c in ("retirar", "agotar", "faltante"):
+                        nombre_c, existe_c = resolver_producto(
+                            acc.get("producto"), sorted(cat_por_nombre, key=str.lower))
+                        if existe_c and tipo_c in ("retirar", "agotar"):
+                            candidatos_f[nombre_c] = cat_por_nombre[nombre_c]
+                        elif not existe_c:
+                            manuales_f.append((nombre_c, acc.get("categoria")))
                 for item in validas_a:
                     aplicar_accion(st.session_state.lotes, item["accion"], hoy_a)
+                agotados_a = registrar_agotados(candidatos_f)
+                for nombre_m, cat_m in manuales_f:
+                    if registrar_faltante(nombre_m, cat_m or "Otros", "", "manual"):
+                        agotados_a.append(nombre_m)
                 if guardar():
                     quien_usuario = st.session_state.get("usuario", "")
                     resumen_a = "; ".join(i["texto"] for i in validas_a)
+                    extra_a = f" 🚨 En Faltantes: {', '.join(agotados_a)}." if agotados_a else ""
                     del st.session_state.asist
                     st.session_state.asist_n = n_asist + 1
-                    avisar("success", f"Listo{', ' + quien_usuario if quien_usuario else ''} 👍 {resumen_a}.")
+                    avisar("success", f"Listo{', ' + quien_usuario if quien_usuario else ''} 👍 {resumen_a}.{extra_a}")
                     st.rerun()
 
 
@@ -1626,7 +1911,8 @@ with tab_editar:
                 "Categoría:", CATEGORIAS,
                 index=CATEGORIAS.index(lote["categoria"]) if lote["categoria"] in CATEGORIAS else 0,
             )
-            nuevas_cajas = st.number_input("Cajas:", min_value=1, value=int(lote["cajas"]), step=1)
+            nuevas_cajas = st.number_input(
+                "Cajas (0 = se acabó):", min_value=0, value=int(lote["cajas"]), step=1)
             nuevo_venc = st.date_input(
                 "Vencimiento:", value=a_fecha(lote["vencimiento"]) or date.today(), format="DD/MM/YYYY",
             )
@@ -1644,8 +1930,16 @@ with tab_editar:
                     lote["categoria"] = nueva_cat
                     lote["cajas"] = int(nuevas_cajas)
                     lote["vencimiento"] = SIN_FECHA if quitar_venc else nuevo_venc.isoformat()
+                    agotado = []
+                    if int(nuevas_cajas) == 0:   # lote en cero: sale del inventario
+                        st.session_state.lotes = [l for l in st.session_state.lotes if l["id"] != id_sel]
+                        agotado = registrar_agotados({lote["nombre"]: nueva_cat})
                     if guardar():
-                        avisar("success", "Lote actualizado ✅")
+                        if int(nuevas_cajas) == 0:
+                            avisar("success", "Lote en cero: se quitó del inventario"
+                                   + (f" y {agotado[0]} quedó en Faltantes 🚨." if agotado else "."))
+                        else:
+                            avisar("success", "Lote actualizado ✅")
                         st.rerun()
 
         st.divider()
