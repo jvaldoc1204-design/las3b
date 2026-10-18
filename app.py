@@ -33,17 +33,143 @@ except ImportError:  # sin estas librerías la app funciona en modo local (JSON)
 #  INVENTARIO DE BODEGA - DISTRIBUIDORA LAS 3B
 # =====================================================
 
-VERSION = "beta 1.4"
+VERSION = "beta 1.5"
 ARCHIVO_DATOS = "inventario_las3b.json"
 CATEGORIAS = ["Aseo", "Higiene", "Abarrotes", "Lácteos", "Bebestibles", "Otros"]
 DIAS_ALERTA = 30      # "Por vencer" si faltan 30 días o menos
 DIAS_URGENTE = 7      # "Urgente" si faltan 7 días o menos
 
+import html
 import os as _os
 _LOGO = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "logo.jpg")
 _HAY_LOGO = _os.path.exists(_LOGO)
 
 st.set_page_config(page_title="Las 3B - Bodega", page_icon=_LOGO if _HAY_LOGO else "📦", layout="centered")
+
+
+# -----------------------------------------------------
+#  DISEÑO (colores de Las 3B, pensado para celular)
+# -----------------------------------------------------
+ESTILOS = """
+<style>
+:root {
+  --l3-rojo: #E23744; --l3-verde: #2E9E5B; --l3-amarillo: #E0A100;
+  --l3-naranja: #E8731A; --l3-gris: #8A8AA0;
+}
+.block-container { padding-top: 1.2rem; padding-bottom: 3rem; max-width: 760px; }
+footer { visibility: hidden; }
+
+/* Botones grandes y redondeados (fáciles de tocar con una mano) */
+.stButton > button, .stFormSubmitButton > button {
+  min-height: 3rem; border-radius: 14px; font-weight: 600; width: 100%;
+  transition: transform .06s ease;
+}
+.stButton > button:active, .stFormSubmitButton > button:active { transform: scale(.98); }
+.stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primary"] {
+  box-shadow: 0 2px 8px rgba(226,55,68,.30);
+}
+
+/* Pestañas: deslizables y más grandes */
+.stTabs [data-baseweb="tab-list"] {
+  gap: .25rem; overflow-x: auto; scrollbar-width: none; padding-bottom: 2px;
+}
+.stTabs [data-baseweb="tab-list"]::-webkit-scrollbar { display: none; }
+.stTabs [data-baseweb="tab"] {
+  height: 2.9rem; padding: 0 .9rem; border-radius: 12px 12px 0 0; white-space: nowrap;
+}
+.stTabs [aria-selected="true"] { font-weight: 700; }
+
+/* Campos y contenedores */
+.stTextInput input, .stTextArea textarea, .stNumberInput input, .stDateInput input {
+  border-radius: 12px;
+}
+[data-testid="stForm"], [data-testid="stExpander"], div[data-testid="stVerticalBlockBorderWrapper"] {
+  border-radius: 16px;
+}
+[data-testid="stAudioInput"] { border-radius: 16px; }
+
+/* Resumen de arriba */
+.l3-kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: .5rem; margin: .4rem 0 1rem; }
+.l3-kpi {
+  background: var(--secondary-background-color); border-radius: 16px; padding: .7rem .4rem;
+  text-align: center; border-bottom: 4px solid var(--l3-gris);
+}
+.l3-kpi b { display: block; font-size: 1.5rem; line-height: 1.1; }
+.l3-kpi span { font-size: .72rem; opacity: .75; }
+.l3-kpi.verde { border-color: var(--l3-verde); }
+.l3-kpi.amarillo { border-color: var(--l3-amarillo); }
+.l3-kpi.rojo { border-color: var(--l3-rojo); }
+
+/* Tarjetas de producto */
+.l3-card {
+  display: flex; justify-content: space-between; align-items: center; gap: .6rem;
+  background: var(--secondary-background-color); border-radius: 14px;
+  padding: .7rem .9rem; margin-bottom: .5rem; border-left: 6px solid var(--l3-gris);
+}
+.l3-card.ok { border-left-color: var(--l3-verde); }
+.l3-card.alerta { border-left-color: var(--l3-amarillo); }
+.l3-card.urgente { border-left-color: var(--l3-naranja); }
+.l3-card.vencido { border-left-color: var(--l3-rojo); }
+.l3-nombre { font-weight: 650; line-height: 1.2; word-break: break-word; }
+.l3-sub { font-size: .78rem; opacity: .75; margin-top: .15rem; }
+.l3-cajas { text-align: right; white-space: nowrap; font-size: 1.35rem; font-weight: 700; line-height: 1; }
+.l3-cajas small { display: block; font-size: .65rem; font-weight: 500; opacity: .7; }
+</style>
+"""
+
+
+def estilos():
+    st.markdown(ESTILOS, unsafe_allow_html=True)
+
+
+def clase_estado(dias):
+    if dias is None or pd.isna(dias):
+        return "sin"
+    if dias < 0:
+        return "vencido"
+    if dias <= DIAS_URGENTE:
+        return "urgente"
+    if dias <= DIAS_ALERTA:
+        return "alerta"
+    return "ok"
+
+
+def tarjetas_html(items):
+    """items: lista de dicts {nombre, cajas, sub, clase}. Devuelve el HTML (con todo escapado)."""
+    partes = []
+    for it in items:
+        partes.append(
+            f'<div class="l3-card {html.escape(it.get("clase", ""))}">'
+            f'<div><div class="l3-nombre">{html.escape(str(it["nombre"]))}</div>'
+            f'<div class="l3-sub">{html.escape(str(it.get("sub", "")))}</div></div>'
+            f'<div class="l3-cajas">{int(it["cajas"])}<small>cajas</small></div></div>'
+        )
+    return "".join(partes)
+
+
+def kpis_html(cajas, productos, por_vencer, vencidos):
+    def k(valor, texto, clase=""):
+        return f'<div class="l3-kpi {clase}"><b>{valor}</b><span>{texto}</span></div>'
+    return (
+        '<div class="l3-kpis">'
+        + k(cajas, "cajas", "verde") + k(productos, "productos")
+        + k(por_vencer, "por vencer", "amarillo") + k(vencidos, "vencidos", "rojo")
+        + "</div>"
+    )
+
+
+def texto_vence(dias, iso):
+    if dias is None or pd.isna(dias):
+        return "Sin vencimiento"
+    f = fmt_fecha(iso)
+    if dias < 0:
+        return f"Vencido hace {-dias} d · {f}"
+    if dias == 0:
+        return f"Vence HOY · {f}"
+    return f"Vence en {dias} d · {f}"
+
+
+estilos()
 
 
 def encabezado(subtitulo):
@@ -962,8 +1088,8 @@ lotes = st.session_state.lotes
 vencidos = sum(1 for l in lotes if (dias_restantes(l) is not None and dias_restantes(l) < 0))
 por_vencer = sum(1 for l in lotes if (dias_restantes(l) is not None and 0 <= dias_restantes(l) <= DIAS_ALERTA))
 st.markdown(
-    f"**{sum(l['cajas'] for l in lotes)} cajas** · {len(nombres_productos())} productos · "
-    f"🟡 {por_vencer} por vencer · 🔴 {vencidos} vencidos"
+    kpis_html(sum(l["cajas"] for l in lotes), len(nombres_productos()), por_vencer, vencidos),
+    unsafe_allow_html=True,
 )
 
 (tab_asistente, tab_inventario, tab_factura, tab_venc,
@@ -1000,8 +1126,18 @@ with tab_inventario:
                 .sort_values("Producto")
             )
             simple["Vence"] = simple["Vence"].map(lambda d: None if d == SENTINELA else d)
-            st.dataframe(simple, hide_index=True)
-            st.caption("Vence en blanco = producto sin fecha de vencimiento.")
+            tarjetas = []
+            for _, fila_s in simple.iterrows():
+                f_ven = None if pd.isna(fila_s["Vence"]) else fila_s["Vence"]
+                dias_s = None if f_ven is None else (f_ven - date.today()).days
+                tarjetas.append({
+                    "nombre": fila_s["Producto"], "cajas": int(fila_s["Cajas"]),
+                    "sub": texto_vence(dias_s, None if f_ven is None else f_ven.isoformat()),
+                    "clase": clase_estado(dias_s),
+                })
+            st.markdown(tarjetas_html(tarjetas), unsafe_allow_html=True)
+            with st.expander("Ver como tabla"):
+                st.dataframe(simple, hide_index=True)
 
         if st.toggle("➕ Ver más detalle", key="inv_detalle"):
             st.divider()
@@ -1372,10 +1508,17 @@ with tab_venc:
         if df_v.empty:
             st.success(f"Nada vence en los próximos {DIAS_ALERTA} días 🎉")
         else:
-            st.dataframe(
-                df_v[["Estado", "Producto", "Cajas", "Vencimiento", "Días restantes"]],
-                hide_index=True,
-            )
+            st.markdown(tarjetas_html([
+                {"nombre": r_v["Producto"], "cajas": int(r_v["Cajas"]),
+                 "sub": texto_vence(int(r_v["Días restantes"]), r_v["Vencimiento"].isoformat()),
+                 "clase": clase_estado(int(r_v["Días restantes"]))}
+                for _, r_v in df_v.iterrows()
+            ]), unsafe_allow_html=True)
+            with st.expander("Ver como tabla"):
+                st.dataframe(
+                    df_v[["Estado", "Producto", "Cajas", "Vencimiento", "Días restantes"]],
+                    hide_index=True,
+                )
         st.caption(
             f"🟠 {DIAS_URGENTE} días o menos · 🟡 {DIAS_ALERTA} días o menos · 🔴 ya vencido"
         )
