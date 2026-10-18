@@ -10,6 +10,7 @@ import copy
 import difflib
 import unicodedata
 import hashlib
+import hmac
 from datetime import date, datetime, timedelta
 
 try:
@@ -33,7 +34,7 @@ except ImportError:  # sin estas librerías la app funciona en modo local (JSON)
 #  INVENTARIO DE BODEGA - DISTRIBUIDORA LAS 3B
 # =====================================================
 
-VERSION = "beta 1.7"
+VERSION = "beta 1.8"
 ARCHIVO_DATOS = "inventario_las3b.json"
 ARCHIVO_FALTANTES = "faltantes_las3b.json"
 CATEGORIAS = ["Aseo", "Higiene", "Abarrotes", "Lácteos", "Bebestibles", "Otros"]
@@ -231,18 +232,141 @@ def usuarios_permitidos():
     return USUARIOS_POR_DEFECTO
 
 
+COOKIE_SESION = "las3b_sesion"
+DIAS_SESION = 30
+
+
+def secreto_tokens():
+    """Clave para firmar las sesiones guardadas. Sale de los Secrets; sin ella no se ofrece 'recordar'."""
+    try:
+        for nombre in ("token_secret", "supabase_key"):
+            if nombre in st.secrets and str(st.secrets[nombre]).strip():
+                return ("las3b|" + str(st.secrets[nombre]).strip()).encode()
+        if "gcp_service_account" in st.secrets:
+            pk = str(st.secrets["gcp_service_account"]["private_key"]).strip()
+            if pk:
+                return ("las3b|" + pk).encode()
+    except Exception:
+        pass
+    return None
+
+
+def _firma(secreto, datos):
+    return hmac.new(secreto, datos, hashlib.sha256).hexdigest()[:40]
+
+
+def crear_token(usuario, dias=DIAS_SESION, ahora=None):
+    secreto = secreto_tokens()
+    if not secreto:
+        return None
+    vence = int((ahora or time.time()) + dias * 86400)
+    datos = base64.urlsafe_b64encode(f"{usuario}|{vence}".encode("utf-8"))
+    return datos.decode() + "." + _firma(secreto, datos)
+
+
+def validar_token(token, ahora=None):
+    """Devuelve el nombre del usuario si el token es auténtico, no venció y esa persona sigue autorizada."""
+    secreto = secreto_tokens()
+    if not secreto or not isinstance(token, str) or token.count(".") != 1:
+        return None
+    datos, firma = token.split(".")
+    try:
+        if not hmac.compare_digest(firma, _firma(secreto, datos.encode())):
+            return None
+        usuario, vence = base64.urlsafe_b64decode(datos.encode()).decode("utf-8").rsplit("|", 1)
+        if int(vence) < (ahora or time.time()):
+            return None
+    except Exception:
+        return None
+    if usuario.lower() not in nombres_con_acceso():
+        return None
+    return usuario
+
+
+def claves_por_usuario():
+    """Opcional: en los Secrets, [claves] con una clave distinta para cada persona."""
+    try:
+        d = st.secrets["claves"]
+        return {str(k): str(v) for k, v in dict(d).items() if str(v).strip()}
+    except Exception:
+        return {}
+
+
+def nombres_con_acceso():
+    claves = claves_por_usuario()
+    if claves:
+        return [k.strip().lower() for k in claves]
+    return usuarios_permitidos()
+
+
+def usuario_por_clave(escrita):
+    """Devuelve el nombre si la clave es válida (o None)."""
+    escrita = str(escrita or "").strip().lower()
+    if not escrita:
+        return None
+    claves = claves_por_usuario()
+    if claves:
+        for nombre, k in claves.items():
+            if hmac.compare_digest(escrita.encode(), k.strip().lower().encode()):
+                return nombre.strip().capitalize()
+        return None
+    return escrita.capitalize() if escrita in usuarios_permitidos() else None
+
+
+def _js_cookie(codigo):
+    st.components.v1.html("<script>" + codigo + "</script>", height=0)
+
+
+def poner_cookie(token):
+    _js_cookie(
+        "const https = (window.parent.location.protocol === 'https:');"
+        f"document.cookie = '{COOKIE_SESION}=' + {json.dumps(token)} + '; max-age={DIAS_SESION * 86400}; path=/; SameSite=Lax' + (https ? '; Secure' : '');"
+    )
+
+
+def borrar_cookie():
+    _js_cookie(f"document.cookie = '{COOKIE_SESION}=; max-age=0; path=/; SameSite=Lax';")
+
+
+def usuario_desde_cookie():
+    try:
+        return validar_token(st.context.cookies.get(COOKIE_SESION))
+    except Exception:
+        return None
+
+
+def cerrar_sesion():
+    """Cierra la sesión y también olvida este celular."""
+    st.session_state.clear()
+    st.session_state["sin_auto"] = True
+    st.rerun()
+
+
 def pantalla_acceso():
     """Si no hay sesión iniciada, muestra el acceso y detiene la app (no carga datos)."""
     if st.session_state.get("usuario"):
         return
+    if st.session_state.get("sin_auto"):
+        borrar_cookie()                  # al cerrar sesión se olvida este celular
+    else:
+        recordado = usuario_desde_cookie()
+        if recordado:
+            st.session_state.usuario = recordado.capitalize()
+            return
     encabezado(f"Versión {VERSION}")
     with st.form("form_acceso"):
         clave = st.text_input("Ingrese contraseña", type="password")
+        recordar = False
+        if secreto_tokens():
+            recordar = st.checkbox(f"Recordar este celular ({DIAS_SESION} días)", value=True)
         entrar = st.form_submit_button("Entrar")
     if entrar:
-        nombre = clave.strip().lower()
-        if nombre and nombre in usuarios_permitidos():
-            st.session_state.usuario = nombre.capitalize()
+        quien = usuario_por_clave(clave)
+        if quien:
+            st.session_state.usuario = quien
+            st.session_state.pop("sin_auto", None)
+            if recordar:
+                st.session_state.poner_cookie = crear_token(quien)
             st.rerun()
         else:
             time.sleep(1)  # frena un poco los intentos al azar
@@ -251,6 +375,8 @@ def pantalla_acceso():
 
 
 pantalla_acceso()
+if st.session_state.get("poner_cookie"):
+    poner_cookie(st.session_state.pop("poner_cookie"))
 
 
 # -----------------------------------------------------
@@ -361,6 +487,22 @@ def _fecha_o_none(v):
     return f.isoformat() if f else None
 
 
+def lote_desde_fila_sb(f):
+    return {
+        "id": str(f["id"]), "nombre": f["nombre"], "categoria": f.get("categoria") or "Otros",
+        "cajas": int(f["cajas"]), "vencimiento": str(f.get("vencimiento") or ""),
+        "proveedor": f.get("proveedor") or "", "ingreso": str(f.get("ingreso") or ""),
+    }
+
+
+def faltante_desde_fila_sb(f):
+    return {
+        "nombre": f["nombre"], "categoria": f.get("categoria") or "Otros",
+        "desde": str(f.get("desde") or ""), "nota": f.get("nota") or "",
+        "origen": f.get("origen") or "auto",
+    }
+
+
 def lotes_a_filas_sb(lotes):
     return [{
         "id": str(l["id"]), "nombre": l["nombre"], "categoria": l.get("categoria") or "Otros",
@@ -432,11 +574,7 @@ def cargar_lotes():
         except Exception as e:
             st.error(f"No pude leer Supabase: {e}")
             return st.session_state.get("lotes", [])
-        return [{
-            "id": str(f["id"]), "nombre": f["nombre"], "categoria": f.get("categoria") or "Otros",
-            "cajas": int(f["cajas"]), "vencimiento": str(f.get("vencimiento") or ""),
-            "proveedor": f.get("proveedor") or "", "ingreso": str(f.get("ingreso") or ""),
-        } for f in filas]
+        return [lote_desde_fila_sb(f) for f in filas]
 
     # --- Modo nube: Google Sheets ---
     if usar_sheets():
@@ -489,11 +627,7 @@ def cargar_faltantes():
         except Exception as e:
             st.warning(f"No pude leer la lista de faltantes: {e}")
             return st.session_state.get("faltantes", [])
-        return [{
-            "nombre": f["nombre"], "categoria": f.get("categoria") or "Otros",
-            "desde": str(f.get("desde") or ""), "nota": f.get("nota") or "",
-            "origen": f.get("origen") or "auto",
-        } for f in filas]
+        return [faltante_desde_fila_sb(f) for f in filas]
     if usar_sheets():
         try:
             return faltantes_desde_sheets()
@@ -540,12 +674,90 @@ if modo_nube() or "faltantes" not in st.session_state:
 st.session_state.setdefault("faltantes_sucio", False)
 
 
+RESPALDO_DIAS_TODOS = 3      # se guardan todos los respaldos de los últimos 3 días
+RESPALDO_DIAS_MAX = 30       # después, uno por día hasta 30 días
+
+
+def huella_estado(lotes, faltantes):
+    datos = json.dumps(
+        {"l": sorted(lotes_a_filas_sb(lotes), key=lambda x: x["id"]),
+         "f": sorted(faltantes_a_filas_sb(faltantes), key=lambda x: x["nombre"])},
+        sort_keys=True, ensure_ascii=False)
+    return hashlib.md5(datos.encode("utf-8")).hexdigest()
+
+
+def _fecha_utc(texto):
+    t = datetime.fromisoformat(str(texto).replace("Z", "+00:00"))
+    if t.tzinfo is None:
+        from datetime import timezone
+        t = t.replace(tzinfo=timezone.utc)
+    return t
+
+
+def hora_chile(texto):
+    """'2026-10-18T20:42:10+00:00' -> '18/10 17:42' (hora de Chile)."""
+    try:
+        t = _fecha_utc(texto)
+        if ZoneInfo is not None:
+            t = t.astimezone(ZoneInfo("America/Santiago"))
+        return t.strftime("%d/%m %H:%M")
+    except Exception:
+        return str(texto)[:16]
+
+
+def podar_respaldos():
+    """Borra respaldos viejos: quedan todos los de 3 días y uno por día hasta los 30 días."""
+    hoy = hoy_chile().isoformat()
+    if st.session_state.get("poda_dia") == hoy:
+        return
+    from datetime import timezone
+    ahora = datetime.now(timezone.utc)
+    dias_vistos, borrar = set(), []
+    for f in sb_leer("respaldos", "creado.desc", "id,creado"):       # del más nuevo al más viejo
+        t = _fecha_utc(f["creado"])
+        edad = (ahora - t).days
+        if edad < RESPALDO_DIAS_TODOS:
+            continue
+        dia = (t.astimezone(ZoneInfo("America/Santiago")) if ZoneInfo else t).date()
+        if edad > RESPALDO_DIAS_MAX or dia in dias_vistos:
+            borrar.append(f["id"])
+        else:
+            dias_vistos.add(dia)
+    for i in range(0, len(borrar), 100):
+        sb_pedir("DELETE", "respaldos", params={"id": "in.(" + ",".join(str(x) for x in borrar[i:i + 100]) + ")"})
+    st.session_state.poda_dia = hoy
+
+
+def respaldar(forzar=False):
+    """Guarda una copia completa (lotes + faltantes) en Supabase. Nunca hace fallar un guardado."""
+    if not usar_supabase():
+        return False
+    lotes, falt = st.session_state.lotes, st.session_state.faltantes
+    huella = huella_estado(lotes, falt)
+    if not forzar and st.session_state.get("respaldo_huella") == huella:
+        return True
+    try:
+        sb_pedir("POST", "respaldos", cuerpo={
+            "usuario": st.session_state.get("usuario", ""), "huella": huella,
+            "n_lotes": len(lotes), "total_cajas": sum(int(l["cajas"]) for l in lotes),
+            "lotes": lotes_a_filas_sb(lotes), "faltantes": faltantes_a_filas_sb(falt),
+        }, extra={"Prefer": "return=minimal"})
+        st.session_state.respaldo_huella = huella
+        st.session_state.pop("respaldo_error", None)
+        podar_respaldos()
+        return True
+    except Exception as e:
+        st.session_state.respaldo_error = str(e)
+        return False
+
+
 def guardar():
     """Devuelve True solo si los datos realmente se guardaron."""
     if not guardar_lotes(st.session_state.lotes):
         return False
     limpiar_faltantes()          # los que ya tienen stock salen de la lista
     guardar_faltantes_si_hace_falta()
+    respaldar()
     return True
 
 
@@ -553,6 +765,7 @@ def guardar_faltantes_si_hace_falta():
     if st.session_state.get("faltantes_sucio"):
         if guardar_faltantes(st.session_state.faltantes):
             st.session_state.faltantes_sucio = False
+            respaldar()
             return True
         return False
     return True
@@ -1400,10 +1613,11 @@ with st.sidebar:
     st.caption(f"Versión {VERSION}")
     st.caption(f"👤 {st.session_state.get('usuario', '')}")
     if st.button("🔒 Cerrar sesión", key="salir_lateral"):
-        st.session_state.clear()
-        st.rerun()
+        cerrar_sesion()
     if usar_supabase():
         st.success("☁️ Datos guardados en Supabase")
+        if st.session_state.get("respaldo_error"):
+            st.warning("⚠️ No se pudo hacer el respaldo automático. Mira la pestaña 🛟 Respaldos.")
     elif usar_sheets():
         st.success("☁️ Datos guardados en Google Sheets")
     else:
@@ -1451,7 +1665,7 @@ if usar_supabase() and not st.session_state.lotes and not st.session_state.falta
                         st.rerun()
 
 (tab_asistente, tab_inventario, tab_falt, tab_factura, tab_venc,
- tab_retirar, tab_ingresar, tab_editar, tab_dup) = st.tabs([
+ tab_retirar, tab_ingresar, tab_editar, tab_dup, tab_resp) = st.tabs([
     "🤖 Asistente",
     "📦 Inventario",
     f"🚨 Faltantes ({len(st.session_state.faltantes)})" if st.session_state.faltantes else "🚨 Faltantes",
@@ -1461,6 +1675,7 @@ if usar_supabase() and not st.session_state.lotes and not st.session_state.falta
     "➕ Ingresar",
     "✏️ Editar",
     "🧹 Duplicados",
+    "🛟 Respaldos",
 ])
 
 
@@ -2168,10 +2383,74 @@ with tab_dup:
 
 
 # -----------------------------------------------------
+#  8. RESPALDOS
+# -----------------------------------------------------
+with tab_resp:
+    st.subheader("Respaldos")
+    df_descarga = pd.DataFrame(st.session_state.lotes, columns=CAMPOS)
+    st.download_button(
+        "⬇️ Descargar inventario (CSV)",
+        data=df_descarga.to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"inventario_las3b_{hoy_chile().isoformat()}.csv", mime="text/csv",
+        help="Una copia en tu celular o computador, por si acaso.",
+    )
+    if not usar_supabase():
+        st.info("Los respaldos automáticos funcionan con Supabase. Mientras tanto puedes descargar el CSV.")
+    else:
+        st.caption(
+            "Con cada cambio se guarda una copia automática. Se conservan todas las de los últimos "
+            f"{RESPALDO_DIAS_TODOS} días y una por día hasta los {RESPALDO_DIAS_MAX} días."
+        )
+        if st.session_state.get("respaldo_error"):
+            st.warning(
+                "No se pudo guardar el último respaldo: " + st.session_state.respaldo_error
+                + "\n\n¿Ya creaste la tabla? Pega `supabase_respaldos.sql` en el SQL Editor de Supabase."
+            )
+        if st.button("💾 Respaldar ahora", key="resp_ahora"):
+            if respaldar(forzar=True):
+                avisar("success", "Respaldo guardado ✅")
+                st.rerun()
+        try:
+            respaldos = sb_leer("respaldos", "creado.desc", "id,creado,usuario,n_lotes,total_cajas")
+        except Exception as e:
+            respaldos = []
+            st.error(f"No pude leer los respaldos: {e}")
+        if respaldos:
+            ver = respaldos[:60]
+            etiquetas_r = {
+                r["id"]: f"{hora_chile(r['creado'])} · {r.get('usuario') or '—'} · "
+                         f"{r['n_lotes']} lotes · {r['total_cajas']} cajas"
+                for r in ver
+            }
+            id_resp = st.selectbox("Respaldo:", list(etiquetas_r), format_func=lambda i: etiquetas_r[i], key="resp_sel")
+            elegido = next(r for r in ver if r["id"] == id_resp)
+            st.caption(
+                f"Ahora hay {len(st.session_state.lotes)} lotes y "
+                f"{sum(int(l['cajas']) for l in st.session_state.lotes)} cajas. "
+                f"Ese respaldo tiene {elegido['n_lotes']} lotes y {elegido['total_cajas']} cajas."
+            )
+            conf_r = st.checkbox("Confirmo que quiero volver a ese respaldo", key="resp_conf")
+            if st.button("♻️ Restaurar este respaldo", disabled=not conf_r, key="resp_restaurar"):
+                try:
+                    fila_r = sb_pedir("GET", "respaldos", params={"id": f"eq.{id_resp}", "select": "*"}).json()[0]
+                except Exception as e:
+                    st.error(f"No pude leer ese respaldo: {e}")
+                else:
+                    respaldar()      # primero queda copia de cómo estaba ahora
+                    st.session_state.lotes = [lote_desde_fila_sb(f) for f in fila_r["lotes"]]
+                    st.session_state.faltantes = [faltante_desde_fila_sb(f) for f in fila_r["faltantes"]]
+                    st.session_state.faltantes_sucio = True
+                    if guardar():
+                        avisar("success", f"Restaurado el respaldo del {hora_chile(fila_r['creado'])} ✅")
+                        st.rerun()
+        elif not st.session_state.get("respaldo_error"):
+            st.info("Aún no hay respaldos. Se crea el primero con el próximo cambio.")
+
+
+# -----------------------------------------------------
 #  PIE DE PÁGINA
 # -----------------------------------------------------
 st.divider()
 if st.button("🔒 Cerrar sesión", key="salir_pie"):
-    st.session_state.clear()
-    st.rerun()
+    cerrar_sesion()
 st.caption(f"Las 3B · Versión {VERSION} · Hecho con cariño · 67 🫳🫴")
