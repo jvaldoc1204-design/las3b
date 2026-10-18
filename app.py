@@ -33,7 +33,7 @@ except ImportError:  # sin estas librerías la app funciona en modo local (JSON)
 #  INVENTARIO DE BODEGA - DISTRIBUIDORA LAS 3B
 # =====================================================
 
-VERSION = "beta 1.6"
+VERSION = "beta 1.7"
 ARCHIVO_DATOS = "inventario_las3b.json"
 ARCHIVO_FALTANTES = "faltantes_las3b.json"
 CATEGORIAS = ["Aseo", "Higiene", "Abarrotes", "Lácteos", "Bebestibles", "Otros"]
@@ -254,18 +254,127 @@ pantalla_acceso()
 
 
 # -----------------------------------------------------
+#  FECHAS (se usan al cargar los datos)
+# -----------------------------------------------------
+SIN_FECHA = ""                 # un lote sin vencimiento guarda texto vacío
+FECHA_LEJANA = "9999-12-31"    # solo para ordenar: los lotes sin fecha van al final
+SENTINELA = date(9999, 12, 31)
+
+
+def a_fecha(texto):
+    """'YYYY-MM-DD' -> date. Devuelve None si el lote no tiene vencimiento."""
+    texto = str(texto or "").strip()
+    if not texto:
+        return None
+    for formato in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):   # por si alguien editó la planilla a mano
+        try:
+            return datetime.strptime(texto[:10], formato).date()
+        except ValueError:
+            continue
+    return None
+
+
+def fecha_iso(texto):
+    """Fecha como 'YYYY-MM-DD' si se entiende; si no, el texto tal cual (no se pierde nada)."""
+    f = a_fecha(texto)
+    return f.isoformat() if f else str(texto or "").strip()
+
+
+# -----------------------------------------------------
 #  ALMACENAMIENTO
 # -----------------------------------------------------
 CAMPOS = ["id", "nombre", "categoria", "cajas", "vencimiento", "proveedor", "ingreso"]
 CAMPOS_F = ["nombre", "categoria", "desde", "nota", "origen"]
 
 
-def usar_sheets():
-    """True si están configurados los Secrets de Google Sheets."""
+def sheets_configurado():
+    """True si están los Secrets de Google Sheets (aunque no sea la base principal)."""
     try:
         return gspread is not None and "gcp_service_account" in st.secrets
     except Exception:
         return False
+
+
+def usar_supabase():
+    """True si están los Secrets de Supabase: entonces esa es la base de datos principal."""
+    try:
+        return requests is not None and "supabase_url" in st.secrets and "supabase_key" in st.secrets
+    except Exception:
+        return False
+
+
+def usar_sheets():
+    """Google Sheets como base principal (solo si NO hay Supabase configurado)."""
+    return sheets_configurado() and not usar_supabase()
+
+
+def modo_nube():
+    return usar_supabase() or usar_sheets()
+
+
+# ---------- Supabase (API REST, sin librerías extra) ----------
+TRAMO_SB = 500
+
+
+def sb_pedir(metodo, tabla, params=None, cuerpo=None, extra=None):
+    url = str(st.secrets["supabase_url"]).strip().rstrip("/") + "/rest/v1/" + tabla
+    clave = str(st.secrets["supabase_key"]).strip()
+    cabeceras = {"apikey": clave, "Authorization": f"Bearer {clave}", "Content-Type": "application/json"}
+    cabeceras.update(extra or {})
+    r = requests.request(metodo, url, headers=cabeceras, params=params, json=cuerpo, timeout=30)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Supabase respondió {r.status_code}: {str(r.text)[:300]}")
+    return r
+
+
+def sb_leer(tabla, orden, columnas="*"):
+    """Lee TODAS las filas (Supabase entrega máximo 1000 por consulta)."""
+    filas, desde = [], 0
+    while True:
+        r = sb_pedir("GET", tabla, params={"select": columnas, "order": orden,
+                                           "limit": 1000, "offset": desde})
+        tramo = r.json()
+        filas.extend(tramo)
+        if len(tramo) < 1000:
+            return filas
+        desde += 1000
+
+
+def _sb_valor_in(v):
+    return '"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def sb_guardar_tabla(tabla, clave, filas):
+    """Deja la tabla igual a 'filas': primero inserta/actualiza y después borra lo que sobra."""
+    for i in range(0, len(filas), TRAMO_SB):
+        sb_pedir("POST", tabla, params={"on_conflict": clave}, cuerpo=filas[i:i + TRAMO_SB],
+                 extra={"Prefer": "resolution=merge-duplicates,return=minimal"})
+    nuevas = {str(f[clave]) for f in filas}
+    sobran = [k for k in (str(x[clave]) for x in sb_leer(tabla, clave, clave)) if k not in nuevas]
+    for i in range(0, len(sobran), 100):
+        lista = ",".join(_sb_valor_in(k) for k in sobran[i:i + 100])
+        sb_pedir("DELETE", tabla, params={clave: f"in.({lista})"})
+
+
+def _fecha_o_none(v):
+    f = a_fecha(v)
+    return f.isoformat() if f else None
+
+
+def lotes_a_filas_sb(lotes):
+    return [{
+        "id": str(l["id"]), "nombre": l["nombre"], "categoria": l.get("categoria") or "Otros",
+        "cajas": int(l["cajas"]), "vencimiento": _fecha_o_none(l.get("vencimiento")),
+        "proveedor": l.get("proveedor") or "", "ingreso": _fecha_o_none(l.get("ingreso")),
+    } for l in lotes]
+
+
+def faltantes_a_filas_sb(lista):
+    return [{
+        "nombre": f["nombre"], "categoria": f.get("categoria") or "Otros",
+        "desde": _fecha_o_none(f.get("desde")), "nota": f.get("nota") or "",
+        "origen": f.get("origen") or "auto",
+    } for f in lista]
 
 
 @st.cache_resource
@@ -286,26 +395,56 @@ def obtener_hoja(pestana="lotes"):
     return hoja
 
 
+def lotes_desde_sheets():
+    valores = obtener_hoja().get_all_values()
+    lotes = []
+    for fila in valores[1:]:
+        fila = fila + [""] * (len(CAMPOS) - len(fila))
+        d = dict(zip(CAMPOS, fila))
+        if not d["id"].strip():
+            continue
+        try:
+            d["cajas"] = int(float(d["cajas"]))
+        except ValueError:
+            continue
+        d["vencimiento"] = fecha_iso(d["vencimiento"])
+        d["ingreso"] = fecha_iso(d["ingreso"])
+        lotes.append(d)
+    return lotes
+
+
+def faltantes_desde_sheets():
+    valores = obtener_hoja("faltantes").get_all_values()
+    salida = []
+    for fila in valores[1:]:
+        fila = fila + [""] * (len(CAMPOS_F) - len(fila))
+        d = dict(zip(CAMPOS_F, fila))
+        if d["nombre"].strip():
+            salida.append(d)
+    return salida
+
+
 def cargar_lotes():
+    # --- Supabase ---
+    if usar_supabase():
+        try:
+            filas = sb_leer("lotes", "nombre.asc,vencimiento.asc.nullslast")
+        except Exception as e:
+            st.error(f"No pude leer Supabase: {e}")
+            return st.session_state.get("lotes", [])
+        return [{
+            "id": str(f["id"]), "nombre": f["nombre"], "categoria": f.get("categoria") or "Otros",
+            "cajas": int(f["cajas"]), "vencimiento": str(f.get("vencimiento") or ""),
+            "proveedor": f.get("proveedor") or "", "ingreso": str(f.get("ingreso") or ""),
+        } for f in filas]
+
     # --- Modo nube: Google Sheets ---
     if usar_sheets():
         try:
-            valores = obtener_hoja().get_all_values()
+            return lotes_desde_sheets()
         except Exception as e:
             st.error(f"No pude leer Google Sheets: {e}")
             return st.session_state.get("lotes", [])
-        lotes = []
-        for fila in valores[1:]:
-            fila = fila + [""] * (len(CAMPOS) - len(fila))
-            d = dict(zip(CAMPOS, fila))
-            if not d["id"].strip():
-                continue
-            try:
-                d["cajas"] = int(float(d["cajas"]))
-            except ValueError:
-                continue
-            lotes.append(d)
-        return lotes
 
     # --- Modo local: archivo JSON ---
     if os.path.exists(ARCHIVO_DATOS):
@@ -318,6 +457,14 @@ def cargar_lotes():
 
 
 def guardar_lotes(lotes):
+    if usar_supabase():
+        try:
+            sb_guardar_tabla("lotes", "id", lotes_a_filas_sb(lotes))
+        except Exception as e:
+            st.error(f"No pude guardar en Supabase: {e}")
+            return False
+        return True
+
     if usar_sheets():
         filas = [CAMPOS] + [[l.get(c, "") for c in CAMPOS] for l in lotes]
         try:
@@ -335,22 +482,24 @@ def guardar_lotes(lotes):
 
 
 def cargar_faltantes():
-    """Lista de productos que no quedan en bodega (pestaña 'faltantes')."""
-    if usar_sheets():
+    """Lista de productos que no quedan en bodega."""
+    if usar_supabase():
         try:
-            valores = obtener_hoja("faltantes").get_all_values()
+            filas = sb_leer("faltantes", "desde.asc.nullslast,nombre.asc")
         except Exception as e:
             st.warning(f"No pude leer la lista de faltantes: {e}")
             return st.session_state.get("faltantes", [])
-        if not valores:
-            return []
-        salida = []
-        for fila in valores[1:]:
-            fila = fila + [""] * (len(CAMPOS_F) - len(fila))
-            d = dict(zip(CAMPOS_F, fila))
-            if d["nombre"].strip():
-                salida.append(d)
-        return salida
+        return [{
+            "nombre": f["nombre"], "categoria": f.get("categoria") or "Otros",
+            "desde": str(f.get("desde") or ""), "nota": f.get("nota") or "",
+            "origen": f.get("origen") or "auto",
+        } for f in filas]
+    if usar_sheets():
+        try:
+            return faltantes_desde_sheets()
+        except Exception as e:
+            st.warning(f"No pude leer la lista de faltantes: {e}")
+            return st.session_state.get("faltantes", [])
     if os.path.exists(ARCHIVO_FALTANTES):
         try:
             with open(ARCHIVO_FALTANTES, "r", encoding="utf-8") as f:
@@ -361,6 +510,13 @@ def cargar_faltantes():
 
 
 def guardar_faltantes(lista):
+    if usar_supabase():
+        try:
+            sb_guardar_tabla("faltantes", "nombre", faltantes_a_filas_sb(lista))
+        except Exception as e:
+            st.error(f"No pude guardar la lista de faltantes: {e}")
+            return False
+        return True
     if usar_sheets():
         filas = [CAMPOS_F] + [[f.get(c, "") for c in CAMPOS_F] for f in lista]
         try:
@@ -377,9 +533,9 @@ def guardar_faltantes(lista):
 
 
 # En modo nube se recarga la planilla en cada interacción, así todos ven datos frescos.
-if usar_sheets() or "lotes" not in st.session_state:
+if modo_nube() or "lotes" not in st.session_state:
     st.session_state.lotes = cargar_lotes()
-if usar_sheets() or "faltantes" not in st.session_state:
+if modo_nube() or "faltantes" not in st.session_state:
     st.session_state.faltantes = cargar_faltantes()
 st.session_state.setdefault("faltantes_sucio", False)
 
@@ -410,19 +566,6 @@ def avisar(tipo, texto):
 # -----------------------------------------------------
 #  FUNCIONES DE APOYO
 # -----------------------------------------------------
-SIN_FECHA = ""                 # un lote sin vencimiento guarda texto vacío
-FECHA_LEJANA = "9999-12-31"    # solo para ordenar: los lotes sin fecha van al final
-SENTINELA = date(9999, 12, 31)
-
-
-def a_fecha(texto):
-    """'YYYY-MM-DD' -> date. Devuelve None si el lote no tiene vencimiento."""
-    texto = str(texto or "").strip()
-    if not texto:
-        return None
-    return datetime.strptime(texto[:10], "%Y-%m-%d").date()
-
-
 def clave_venc(lote):
     """Para ordenar lotes: primero los que vencen antes, al final los sin fecha."""
     return str(lote.get("vencimiento") or "").strip() or FECHA_LEJANA
@@ -1259,7 +1402,9 @@ with st.sidebar:
     if st.button("🔒 Cerrar sesión", key="salir_lateral"):
         st.session_state.clear()
         st.rerun()
-    if usar_sheets():
+    if usar_supabase():
+        st.success("☁️ Datos guardados en Supabase")
+    elif usar_sheets():
         st.success("☁️ Datos guardados en Google Sheets")
     else:
         st.warning("💾 Modo local: los datos se guardan en un archivo JSON")
@@ -1281,6 +1426,29 @@ st.markdown(
     kpis_html(sum(l["cajas"] for l in lotes), len(nombres_productos()), por_vencer, vencidos),
     unsafe_allow_html=True,
 )
+
+if usar_supabase() and not st.session_state.lotes and not st.session_state.faltantes and sheets_configurado():
+    with st.container(border=True):
+        st.warning("La base de datos nueva (Supabase) está vacía. ¿Traigo todo lo que hay en Google Sheets?")
+        if st.button("📥 Importar desde Google Sheets", type="primary", key="importar_sheets"):
+            try:
+                lotes_imp = lotes_desde_sheets()
+                try:
+                    falt_imp = faltantes_desde_sheets()
+                except Exception:
+                    falt_imp = []      # si la pestaña 'faltantes' no existe, no pasa nada
+            except Exception as e:
+                st.error(f"No pude leer Google Sheets: {e}")
+            else:
+                if not lotes_imp and not falt_imp:
+                    st.info("Google Sheets también está vacío: no hay nada que importar.")
+                else:
+                    st.session_state.lotes = lotes_imp
+                    st.session_state.faltantes = falt_imp
+                    st.session_state.faltantes_sucio = True
+                    if guardar():
+                        avisar("success", f"Importados {len(lotes_imp)} lotes y {len(falt_imp)} faltantes desde Google Sheets ✅")
+                        st.rerun()
 
 (tab_asistente, tab_inventario, tab_falt, tab_factura, tab_venc,
  tab_retirar, tab_ingresar, tab_editar, tab_dup) = st.tabs([
