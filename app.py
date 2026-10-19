@@ -34,7 +34,7 @@ except ImportError:  # sin estas librerías la app funciona en modo local (JSON)
 #  INVENTARIO DE BODEGA - DISTRIBUIDORA LAS 3B
 # =====================================================
 
-VERSION = "beta 1.8"
+VERSION = "beta 1.8.1"
 ARCHIVO_DATOS = "inventario_las3b.json"
 ARCHIVO_FALTANTES = "faltantes_las3b.json"
 CATEGORIAS = ["Aseo", "Higiene", "Abarrotes", "Lácteos", "Bebestibles", "Otros"]
@@ -318,9 +318,18 @@ def _js_cookie(codigo):
 
 
 def poner_cookie(token):
-    _js_cookie(
+    """Guarda la sesión en el celular y muestra si el navegador la aceptó."""
+    st.components.v1.html(
+        '<div id="r" style="font:14px sans-serif;color:#666">Guardando este celular…</div><script>'
+        "try {"
         "const https = (window.parent.location.protocol === 'https:');"
         f"document.cookie = '{COOKIE_SESION}=' + {json.dumps(token)} + '; max-age={DIAS_SESION * 86400}; path=/; SameSite=Lax' + (https ? '; Secure' : '');"
+        f"const ok = document.cookie.indexOf('{COOKIE_SESION}=') >= 0;"
+        "document.getElementById('r').textContent = ok ? '✅ Listo: este celular quedó recordado' "
+        ": '⚠️ El navegador no dejó guardar la sesión en este celular';"
+        "} catch (e) { document.getElementById('r').textContent = '⚠️ No se pudo guardar la sesión: ' + e; }"
+        "</script>",
+        height=32,
     )
 
 
@@ -335,8 +344,49 @@ def usuario_desde_cookie():
         return None
 
 
+def usuario_desde_url():
+    """Plan B si las cookies no funcionan: el enlace guardado en favoritos trae la sesión (?s=...)."""
+    try:
+        return validar_token(st.query_params.get("s"))
+    except Exception:
+        return None
+
+
+def diagnostico_sesion():
+    """Datos para saber por qué no se recuerda el celular (nunca muestra valores secretos)."""
+    filas = []
+    try:
+        filas.append(f"Versión de Streamlit: {st.__version__}")
+    except Exception:
+        filas.append("Versión de Streamlit: no se pudo leer")
+    filas.append("Clave para firmar sesiones: " + ("sí" if secreto_tokens() else "NO (por eso no ofrece recordar)"))
+    try:
+        cookies = st.context.cookies
+        nombres = sorted(str(k) for k in cookies.keys())
+        filas.append("Cookies que llegan a la app: " + (", ".join(nombres) if nombres else "ninguna"))
+        tok = cookies.get(COOKIE_SESION)
+        if not tok:
+            filas.append("Cookie de sesión de Las 3B: no llegó")
+        else:
+            filas.append("Cookie de sesión de Las 3B: llegó; " + (
+                f"válida para {validar_token(tok)}" if validar_token(tok) else "pero NO es válida (venció, cambió la clave o la persona ya no tiene acceso)"))
+    except Exception as e:
+        filas.append(f"Esta versión de Streamlit no deja leer cookies ({type(e).__name__})")
+    try:
+        t = st.query_params.get("s")
+        filas.append("Enlace con sesión (?s=): " + ("no" if not t else (
+            f"sí, válido para {validar_token(t)}" if validar_token(t) else "sí, pero NO es válido")))
+    except Exception:
+        pass
+    return filas
+
+
 def cerrar_sesion():
     """Cierra la sesión y también olvida este celular."""
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
     st.session_state.clear()
     st.session_state["sin_auto"] = True
     st.rerun()
@@ -349,7 +399,7 @@ def pantalla_acceso():
     if st.session_state.get("sin_auto"):
         borrar_cookie()                  # al cerrar sesión se olvida este celular
     else:
-        recordado = usuario_desde_cookie()
+        recordado = usuario_desde_cookie() or usuario_desde_url()
         if recordado:
             st.session_state.usuario = recordado.capitalize()
             return
@@ -366,11 +416,19 @@ def pantalla_acceso():
             st.session_state.usuario = quien
             st.session_state.pop("sin_auto", None)
             if recordar:
-                st.session_state.poner_cookie = crear_token(quien)
+                token = crear_token(quien)
+                st.session_state.poner_cookie = token
+                try:
+                    st.query_params["s"] = token      # plan B: el enlace también trae la sesión
+                except Exception:
+                    pass
             st.rerun()
         else:
             time.sleep(1)  # frena un poco los intentos al azar
             st.error("Contraseña incorrecta. Sea serio 😐")
+    with st.expander("🔧 ¿No me recuerda el celular? Ver diagnóstico"):
+        for fila_d in diagnostico_sesion():
+            st.write("• " + fila_d)
     st.stop()
 
 
@@ -1614,6 +1672,11 @@ with st.sidebar:
     st.caption(f"👤 {st.session_state.get('usuario', '')}")
     if st.button("🔒 Cerrar sesión", key="salir_lateral"):
         cerrar_sesion()
+    with st.expander("🔧 Diagnóstico de sesión"):
+        for fila_d in diagnostico_sesion():
+            st.write("• " + fila_d)
+        st.caption("Si 'Cookies que llegan' no incluye las3b_sesion, el navegador no la guardó: "
+                   "usa el enlace con ?s=... guardado en favoritos o en la pantalla de inicio.")
     if usar_supabase():
         st.success("☁️ Datos guardados en Supabase")
         if st.session_state.get("respaldo_error"):
